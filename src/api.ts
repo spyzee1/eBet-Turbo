@@ -1,4 +1,5 @@
 const API_BASE = '/api';
+import { getAccessToken } from './lib/supabase';
 
 export interface ScrapedPlayer {
   name: string;
@@ -176,6 +177,8 @@ export interface TopTip {
   gfPerMatchB?: number;
   gaPerMatchB?: number;
   h2hMatchHistory?: Array<{ date: string; goalsA: number; goalsB: number; winner: 'A' | 'B' | 'draw' }>;
+  // Összes forrás O/U oddsai — a frontend a kiválasztott forrás vonalát mutatja
+  allOdds?: Record<string, { ouLine: number; oddsOver?: number; oddsUnder?: number }>;
 }
 
 export interface TopTipsResponse {
@@ -193,7 +196,7 @@ export interface TopTipsResponse {
 }
 
 // ========== MÓDOSÍTOTT fetchTopTips - STRATEGY PARAMÉTERREL ==========
-export async function fetchTopTips(league?: string, limit: number = 5, strategy: 'A' | 'B' = 'B'): Promise<TopTipsResponse> {
+export async function fetchTopTips(league?: string, limit: number = 5, strategy: 'A' | 'B' | 'C' = 'B'): Promise<TopTipsResponse> {
   const params = new URLSearchParams();
   if (league) params.set('league', league);
   params.set('limit', String(limit));
@@ -336,6 +339,292 @@ export async function fetchH2HDetail(playerA: string, playerB: string, league: s
   return res.json();
 }
 
+export interface LiveScore {
+  playerA: string;
+  playerB: string;
+  scoreA: number;
+  scoreB: number;
+  minute: number | null;
+  period?: number | null;
+  periodName: string | null;
+  matchTime?: string | null;
+  isLive: boolean;
+  league?: string | null;
+  source: string;
+}
+
+export async function fetchLiveScores(): Promise<LiveScore[]> {
+  const res = await fetch(`${API_BASE}/live-scores`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function clearServerCache(): Promise<{ cleared: number }> {
+  const res = await fetch(`${API_BASE}/cache/clear`, { method: 'POST' });
+  if (!res.ok) return { cleared: 0 };
+  return res.json();
+}
+
+export interface TrendSignal {
+  playerA: string;
+  playerB: string;
+  league: string;
+  nextMatchTime: string;
+  minutesUntil: number;
+  todayH2H: Array<{ time: string; goalsA: number; goalsB: number; total: number }>;
+  trendSlope: number;
+  avgTotalGoals: number;
+  ouLine: number;
+  oddsOver?: number;
+  oddsSource?: string;
+  allOdds?: Record<string, { ouLine: number; oddsOver?: number }>; // minden forrás odds-ai
+  aboveLinePct: number;
+  aboveLineCount: number;
+  lastTwoAboveLine: boolean;
+  signalStrength: 'VALUE' | 'TREND';
+  yesterdayAvg?: number;
+  prevDayAvg?: number;
+  isSuper?: boolean; // tegnap + tegnapelőtt + ma mind a vonal felett
+}
+
+export interface TrendScannerStatus {
+  lastRun: number;
+  lastRunISO: string | null;
+  lastSignalCount: number;
+  pushedCount: number;
+  errors: number;
+  isRunning: boolean;
+}
+
+export async function getTrendStatus(): Promise<TrendScannerStatus> {
+  const res = await fetch(`${API_BASE}/trend/status`);
+  if (!res.ok) throw new Error(`Hiba: ${res.status}`);
+  return res.json();
+}
+
+export async function triggerTrendScan(): Promise<{ ran: boolean; signalsFound: number; pushed: number; signals: TrendSignal[] }> {
+  const res = await fetch(`${API_BASE}/trend/run`, { method: 'POST' });
+  if (!res.ok) throw new Error(`Hiba: ${res.status}`);
+  return res.json();
+}
+
+export interface ResolveMatch {
+  matchId: string;
+  playerA: string;
+  playerB: string;
+  league: string;
+  timestamp: number;
+  betType: string;
+  betLine: number;
+}
+
+export interface ResolveResult {
+  matchId: string;
+  pending: boolean;
+  score?: string;
+  total?: number;
+  outcome?: 'Win' | 'Loss' | null;
+}
+
+export async function resolveResults(matches: ResolveMatch[]): Promise<ResolveResult[]> {
+  try {
+    const res = await fetch(`${API_BASE}/resolve-results`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ matches }),
+    });
+    if (!res.ok) return matches.map(m => ({ matchId: m.matchId, pending: true }));
+    return res.json();
+  } catch { return matches.map(m => ({ matchId: m.matchId, pending: true })); }
+}
+
+export interface Subscription { plan: string; expires_at: string; }
+
+export async function fetchCheckedMatches(): Promise<any[]> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return [];
+    const res = await fetch(`${API_BASE}/checked-matches`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return [];
+    return res.json();
+  } catch { return []; }
+}
+
+export async function saveCheckedMatches(entries: any[]): Promise<void> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return;
+    await fetch(`${API_BASE}/checked-matches`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(entries),
+    });
+  } catch { /* silent */ }
+}
+
+export async function fetchSubscription(): Promise<Subscription | null> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return null;
+    const res = await fetch(`${API_BASE}/subscription`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return null;
+    return res.json();
+  } catch { return null; }
+}
+
+export async function fetchAdminStatus(): Promise<boolean> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return false;
+    const res = await fetch(`${API_BASE}/admin/status`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return false;
+    const d = await res.json();
+    return !!d.isAdmin;
+  } catch { return false; }
+}
+
+export interface AdminUser {
+  id: string; email: string; created_at: string; email_confirmed: boolean;
+  subscription: { plan: string; expires_at: string } | null;
+}
+
+export async function fetchAdminUsers(): Promise<AdminUser[]> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return [];
+    const res = await fetch(`${API_BASE}/admin/users`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return [];
+    return res.json();
+  } catch { return []; }
+}
+
+export async function adminExtend(userId: string, days = 30): Promise<void> {
+  const token = await getAccessToken();
+  if (!token) return;
+  await fetch(`${API_BASE}/admin/users/${userId}/extend`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ days }),
+  });
+}
+
+export async function adminRevoke(userId: string): Promise<void> {
+  const token = await getAccessToken();
+  if (!token) return;
+  await fetch(`${API_BASE}/admin/users/${userId}/revoke`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+}
+
+export interface SupabaseTableStat {
+  table: string;
+  count: number | null;
+  error?: string;
+}
+
+export interface SupabaseStatsResponse {
+  tables: SupabaseTableStat[];
+  generated: string;
+}
+
+export async function fetchSupabaseStats(): Promise<SupabaseStatsResponse | null> {
+  const token = await getAccessToken();
+  if (!token) return null;
+  const res = await fetch(`${API_BASE}/admin/supabase/stats`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export interface SupabasePeekResponse {
+  table: string;
+  rows: any[];
+  limit: number;
+  offset: number;
+  total: number | null;
+}
+
+export async function fetchSupabasePeek(table: string, limit = 20, offset = 0): Promise<SupabasePeekResponse | null> {
+  const token = await getAccessToken();
+  if (!token) return null;
+  const res = await fetch(`${API_BASE}/admin/supabase/peek/${encodeURIComponent(table)}?limit=${limit}&offset=${offset}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export interface AdminLogEntry { ts: string; level: 'log' | 'warn' | 'error'; msg: string; }
+export interface AdminLogsResponse { logs: AdminLogEntry[]; total: number; }
+
+export async function fetchAdminLogs(limit = 200): Promise<AdminLogsResponse | null> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return null;
+    const res = await fetch(`${API_BASE}/admin/logs?limit=${limit}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return null;
+    return res.json();
+  } catch { return null; }
+}
+
+export async function clearAdminLogs(): Promise<boolean> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return false;
+    const res = await fetch(`${API_BASE}/admin/logs`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+    return res.ok;
+  } catch { return false; }
+}
+
+export async function fetchRemoteSettings(): Promise<Record<string, any> | null> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return null;
+    const res = await fetch(`${API_BASE}/settings`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Object.keys(data).length > 0 ? data : null;
+  } catch { return null; }
+}
+
+export async function saveRemoteSettings(settings: Record<string, any>): Promise<void> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return;
+    await fetch(`${API_BASE}/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(settings),
+    });
+  } catch { /* silent */ }
+}
+
+export async function fetchJournal(): Promise<any[]> {
+  try {
+    const token = await getAccessToken();
+    const res = await fetch(`${API_BASE}/journal`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) return [];
+    return res.json();
+  } catch { return []; }
+}
+
+export async function saveJournal(entries: any[]): Promise<void> {
+  try {
+    const token = await getAccessToken();
+    await fetch(`${API_BASE}/journal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(entries),
+    });
+  } catch { /* silent */ }
+}
+
 export async function autoCheckResults(matches: AutoCheckMatch[]): Promise<AutoCheckResult[]> {
   const res = await fetch(`${API_BASE}/auto-check`, {
     method: 'POST',
@@ -344,4 +633,36 @@ export async function autoCheckResults(matches: AutoCheckMatch[]): Promise<AutoC
   });
   if (!res.ok) throw new Error(`Hiba: ${res.status}`);
   return res.json();
+}
+
+// ── Live Pitch ────────────────────────────────────────────────────────────────
+
+export interface LiveGoalEvent {
+  timeSeconds: number;
+  homeScore:   number;
+  awayScore:   number;
+  side:        'home' | 'away';
+}
+
+export interface LiveMatchState {
+  eventId:          number;
+  homeTeam:         string;
+  awayTeam:         string;
+  league:           string;
+  homeScore:        number;
+  awayScore:        number;
+  matchTimeSeconds: number;
+  eventStatus:      'not_started' | 'in_progress' | 'finished';
+  goals:            LiveGoalEvent[];
+  lastUpdated:      string;
+}
+
+export async function fetchLivePitch(playerA: string, playerB: string): Promise<LiveMatchState | null> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/live-pitch?playerA=${encodeURIComponent(playerA)}&playerB=${encodeURIComponent(playerB)}`
+    );
+    if (!res.ok) return null;
+    return res.json();
+  } catch { return null; }
 }

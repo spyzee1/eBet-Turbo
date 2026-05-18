@@ -1,4 +1,16 @@
-import { getVegasOdds, getAllVegasOdds, clearVegasCache } from './vegas-scraper.js';
+import { config as dotenvConfig } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath as _fileURLToPath } from 'url';
+{
+  const __d = dirname(_fileURLToPath(import.meta.url));
+  // .env helye: app/server/.env (ugyanabban a könyvtárban mint az index.ts)
+  const result = dotenvConfig({ path: resolve(__d, '.env') });
+  if (!result.error) console.log('[env] .env betöltve ✅');
+}
+initDb();
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { getVegasOdds, getAllVegasOdds, clearVegasCache, getAllLiveScores, getRawLiveDebug } from './vegas-scraper.js';
 import {
   scrapeFullPlayerData,
   scrapeSchedule as tcScrapeSchedule,
@@ -19,7 +31,7 @@ import { analyzeTimePerformance, getTimeSummary } from '../src/model/timeFactors
 import {
   scrapeTCLeague, scrapeTCMatchOdds, scrapeTCH2H, aggregateH2H,
   aggregateH2HWeighted, normalizeTCH2H, mergeH2HSources,
-  TC_LEAGUES, NormalizedH2H,
+  TC_LEAGUES, NormalizedH2H, TCFixture,
 } from './totalcorner.js';
 import {
   configureTelegram, isTelegramConfigured, loadConfigFromEnv,
@@ -28,44 +40,420 @@ import {
 import {
   configureScanner, startScanner, runScan, getScannerState, getCachedResult,
 } from './scanner.js';
+import {
+  configureTrendScanner, startTrendScanner, getTrendScannerState, runTrendScanOnce,
+} from './trend-scanner.js';
+import {
+  getMsportOdds, getMsportOddsForMatch, getMsportSchedule, getMsportRawDebug,
+  setMsportCookie, getMsportCookieStatus, getMsportLiveScores,
+  getMsportMatchResults, getMsportPlayerLastMatches, getMsportH2H,
+  injectCompletedMatches, clearOldInjectedMatches, initCompletedMatchesFromDb, MsportMatchResult,
+  scrapeMsportFixtures, clearFixtureCache, getMsportUpcomingSchedule, isMsportRateLimited,
+} from './msport-scraper.js';
+import { initDb, loadJournal, saveJournalDb, loadSettings as loadSettingsDb, saveSettings as saveSettingsDb, loadCheckedMatches, saveCheckedMatchesDb, getSubscription, upsertSubscription, revokeSubscription, supabase, getH2HFromSupabase, getPlayerMatchesFromSupabase } from './db.js';
+import {
+  getCloudbetOdds, getCloudbetOddsForMatch, getCloudbetSchedule,
+  clearCloudbetCache, getCloudbetKeyStatus, testCloudbetApi,
+  listCloudbetCompetitions, discoverCloudbetCompetitions,
+  getCloudbetApiLiveScores,
+} from './cloudbet-scraper.js';
+import {
+  getCloudbetWebSchedule, getCloudbetWebLiveScores, getCloudbetWebResults,
+  getCloudbetWebH2H, getCloudbetWebAllEvents, getCloudbetWebH2HStats,
+  clearCloudbetWebCache, getCloudbetWebDebugEvents, fetchSingleEvent,
+  getCloudbetWebOddsForMatch,
+} from './cloudbet-web-scraper.js';
+import {
+  ensureTracked, refreshMatch, getMatch, getAllMatches, startMatchPoller,
+} from './live-match-tracker.js';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+
+// ── In-memory log buffer ──────────────────────────────────────────────────────
+const MAX_LOG_ENTRIES = 500;
+interface LogEntry { ts: string; level: 'log' | 'warn' | 'error'; msg: string; }
+const _logBuffer: LogEntry[] = [];
+
+function pushLog(level: LogEntry['level'], args: any[]) {
+  const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  _logBuffer.push({ ts: new Date().toISOString(), level, msg });
+  if (_logBuffer.length > MAX_LOG_ENTRIES) _logBuffer.shift();
+}
+
+const _origLog = console.log.bind(console);
+const _origWarn = console.warn.bind(console);
+const _origError = console.error.bind(console);
+console.log = (...a) => { _origLog(...a); pushLog('log', a); };
+console.warn = (...a) => { _origWarn(...a); pushLog('warn', a); };
+console.error = (...a) => { _origError(...a); pushLog('error', a); };
+
+// ── VPS Scraper (Hetzner mini szerver) ───────────────────────────────────────
+// A Hetzner VPS-en futó scraper kiszolgálja a GT Leagues + eAdriatic menetrendet
+// amelyek Render datacenter IP-ről nem scrape-elhetők közvetlenül.
+const VPS_SCRAPER_URL = process.env.VPS_SCRAPER_URL || 'http://65.109.137.14:4000';
+
+let _vpsCache: { schedule: any[]; updatedAt: string } = { schedule: [], updatedAt: '' };
+let _vpsCbOdds: Array<{ playerA: string; playerB: string; league: string; ouLine: number; oddsOver: number; oddsUnder: number }> = [];
+let _vpsCacheTs = 0;
+const VPS_CACHE_TTL = 3 * 60 * 1000; // 3 perc
+
+async function getVpsSchedule(): Promise<any[]> {
+  if (Date.now() - _vpsCacheTs < VPS_CACHE_TTL && _vpsCache.schedule.length > 0) {
+    return _vpsCache.schedule;
+  }
+  try {
+    const ax = await import('axios').then(m => m.default);
+    // Párhuzamosan kérjük a menetrendet, msport odds-okat ÉS cloudbet odds-okat
+    const [schedResp, oddsResp, cbOddsResp] = await Promise.allSettled([
+      ax.get(`${VPS_SCRAPER_URL}/schedule`, { timeout: 8000 }),
+      ax.get(`${VPS_SCRAPER_URL}/msport-odds`, { timeout: 8000 }),
+      ax.get(`${VPS_SCRAPER_URL}/cloudbet-odds`, { timeout: 8000 }),
+    ]);
+
+    if (schedResp.status !== 'fulfilled') throw new Error(schedResp.reason?.message ?? 'schedule hiba');
+    _vpsCache = schedResp.value.data;
+
+    // Ha a VPS odds elérhető, mergeljük a menetrend bejegyzésekbe
+    if (oddsResp.status === 'fulfilled') {
+      const oddsMap = new Map<string, any>();
+      for (const o of (oddsResp.value.data?.odds ?? [])) {
+        const k = `${(o.playerA || '').toLowerCase()}|${(o.playerB || '').toLowerCase()}`;
+        oddsMap.set(k, o);
+      }
+      for (const m of _vpsCache.schedule) {
+        const k = `${(m.playerHome || '').toLowerCase()}|${(m.playerAway || '').toLowerCase()}`;
+        const odd = oddsMap.get(k);
+        if (odd?.ouLine > 0) {
+          m.ouLine    = odd.ouLine;
+          m.oddsOver  = odd.oddsOver;
+          m.oddsUnder = odd.oddsUnder;
+          m.oddsSource = 'msport.com';
+        }
+      }
+      const withOdds = _vpsCache.schedule.filter((m: any) => m.oddsSource === 'msport.com').length;
+      console.log(`[vps] msport odds: ${withOdds}/${_vpsCache.schedule.length} meccsnél`);
+    } else {
+      console.warn(`[vps] msport-odds nem elérhető: ${oddsResp.reason?.message ?? 'ismeretlen hiba'}`);
+    }
+
+    // Cloudbet odds a VPS-ről (GT Leagues + eAdriatic, VPS IP nem blokkolt)
+    if (cbOddsResp.status === 'fulfilled') {
+      _vpsCbOdds = cbOddsResp.value.data?.odds ?? [];
+      console.log(`[vps] cloudbet odds: ${_vpsCbOdds.length} meccsnél`);
+    } else {
+      console.warn(`[vps] cloudbet-odds nem elérhető: ${(cbOddsResp as any).reason?.message ?? 'ismeretlen hiba'}`);
+    }
+
+    _vpsCacheTs = Date.now();
+    console.log(`[vps] ✅ ${_vpsCache.schedule.length} meccs (${_vpsCache.updatedAt})`);
+    return _vpsCache.schedule;
+  } catch (e: any) {
+    console.warn(`[vps] ⚠️ Nem elérhető: ${e.message}`);
+    return _vpsCache.schedule; // visszaadjuk a cache-t ha van
+  }
+}
+
+// ── VPS live-tracked completed results → H2H injektálás ──────────────────────
+// A VPS scraper figyeli az in-play meccseket és menti a befejezetteket.
+// Ez pótolja az msport my-matches/fixtures API-t (ami Render IP-ről blokkolt).
+let _vpsResultsLastFetch = 0;
+const VPS_RESULTS_TTL = 10 * 60 * 1000; // 10 perc
+
+async function fetchVpsResults(): Promise<void> {
+  if (Date.now() - _vpsResultsLastFetch < VPS_RESULTS_TTL) return;
+  _vpsResultsLastFetch = Date.now();
+  try {
+    const ax = await import('axios').then(m => m.default);
+    const resp = await ax.get(`${VPS_SCRAPER_URL}/msport-results`, { timeout: 8000 });
+    const results: MsportMatchResult[] = (resp.data?.results ?? []).filter((r: any) =>
+      r.playerA && r.playerB && r.league &&
+      typeof r.scoreA === 'number' && typeof r.scoreB === 'number'
+    );
+    if (results.length > 0) {
+      const added = await injectCompletedMatches(results);
+      if (added > 0) {
+        console.log(`[vps-results] +${added} befejezett meccs injektálva H2H-hoz (VPS live tracker)`);
+      }
+    }
+  } catch (e: any) {
+    // silent — VPS nem mindig elérhető
+  }
+}
+
 
 // ── TC-only leagues not on esoccerbet.org ─────────────────────────────────────
+// Volta is on esoccerbet.org — use that for rich per-match history. H2H GG is TC-only.
 const TC_ONLY_LEAGUES = new Set(['Esoccer H2H GG League']);
+
+/** TotalCorner serves times in UTC. Budapest is CEST (UTC+2). Add 2 hours. */
+function shiftTCTime<T extends { time?: string }>(entry: T): T {
+  const [h, m] = (entry.time || '00:00').split(':').map(Number);
+  const newH = (h + 2) % 24;
+  return { ...entry, time: `${String(newH).padStart(2, '0')}:${String(m).padStart(2, '0')}` };
+}
+
+/** Filter a TC schedule array to upcoming/in-progress matches.
+ *  Times have already been shifted to Budapest local (CEST = UTC+2).
+ *  Compare directly against server local time — no further offset needed.
+ */
+function filterTCSchedule<T extends { time?: string; scoreHome?: number; scoreAway?: number }>(
+  raw: T[]
+): T[] {
+  return raw.filter(m => {
+    const [mH, mM] = (m.time || '00:00').split(':').map(Number);
+    const matchLocalMinutes = mH * 60 + mM;
+    const now = new Date();
+    const nowLocalMinutes = now.getHours() * 60 + now.getMinutes();
+    let diff = matchLocalMinutes - nowLocalMinutes;
+    if (diff < -720) diff += 1440;
+    if (diff > 720) diff -= 1440;
+    // GT max 12 perc + 2 perc buffer = 14 perc; eAdriatic 10 perc is belefér
+    return diff >= -14;
+  });
+}
+
+// ── Napi Mérkőzések accumulator ───────────────────────────────────────────────
+// Gyűjti az egész nap összes GT Leagues + eAdriatic meccsét (eventId alapján deduplikálva).
+// Minden getCombinedSchedule() hívásnál frissül → scanner lefedés biztosított.
+interface DailyMatchEntry {
+  playerA: string; playerB: string; teamA: string; teamB: string;
+  league: string; time: string; date: string;
+  ouLine: number; oddsOver: number; oddsUnder: number;
+  startTime: number; eventId: string;
+  // Végeredmény — pollCompletedMatchScores tölti ki, ha a meccs véget ért
+  scoreA?: number; scoreB?: number;
+}
+const dailyMatchMap = new Map<string, DailyMatchEntry>();
+let dailyMapDate = '';
+
+function todayMmDd(): string {
+  // Budapest CEST = UTC+2 — explicit offset, szerver timezone-tól független
+  const d = new Date(Date.now() + 2 * 3600 * 1000);
+  return `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** startTime (Unix ms) → "MM/DD" Budapest CEST (UTC+2) */
+function startTimeToMmDd(startTimeMs: number): string {
+  // Budapest = UTC+2; new Date() uses server local time which may be UTC
+  // → Explicit UTC+2 offset biztosítja a helyes dátumot minden szerver-timezone esetén
+  const d = new Date(startTimeMs + 2 * 3600 * 1000);
+  return `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function updateDailyAccum(odds: import('./msport-scraper.js').MsportOdds[]): void {
+  const today = todayMmDd();
+  if (dailyMapDate !== today) { dailyMatchMap.clear(); dailyMapDate = today; }
+  for (const o of odds) {
+    if (dailyMatchMap.has(o.eventId)) continue;
+    const date = startTimeToMmDd(o.startTime);
+    // time-t szándékosan NEM tároljuk UTC-ben — a frontend startTime-ból számítja helyi időben
+    dailyMatchMap.set(o.eventId, {
+      playerA: o.playerA, playerB: o.playerB, teamA: o.teamA, teamB: o.teamB,
+      league: o.league, time: date, date,  // time unused, frontend uses startTime
+      ouLine: o.ouLine, oddsOver: o.oddsOver, oddsUnder: o.oddsUnder,
+      startTime: o.startTime, eventId: o.eventId,
+    });
+  }
+}
+
+/**
+ * TC-ből érkező GT Leagues fixture konvertálása ScheduleEntry formátumba.
+ * startTime: "05/05 17:59" (UTC) → date="05/05", time="19:59" (CEST +2h)
+ */
+function tcFixtureToEntry(f: TCFixture, league: string) {
+  if (!f.playerHome || !f.playerAway || !f.startTime) return null;
+  // Már lezárt meccsek kiszűrése (van score)
+  if (f.score && /\d\s*-\s*\d/.test(f.score)) return null;
+
+  const parts = f.startTime.trim().split(' ');
+  if (parts.length < 2) return null;
+  const date = parts[0]; // "05/05"
+  const timeUTC = parts[1]; // "17:59"
+
+  const [h, m] = timeUTC.split(':').map(Number);
+  const newH = (h + 2) % 24; // UTC → Budapest CEST (+2h)
+  const time = `${String(newH).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+
+  // Közelítő startTime ms (idei év alapján)
+  const now = new Date();
+  const [mo, day] = date.split('/').map(Number);
+  const startTime = Date.UTC(now.getFullYear(), mo - 1, day, h, m, 0);
+
+  return {
+    playerHome: f.playerHome,
+    playerAway: f.playerAway,
+    teamHome: f.teamHome,
+    teamAway: f.teamAway,
+    league,
+    time,
+    date,
+    startTime,
+    eventId: f.matchId,
+  };
+}
+
+/**
+ * Cloudbet belső API event → schedule entry konverzió.
+ * A csapatnév formátuma: "Real Betis (Tifosi)" → teamHome="Real Betis", playerHome="Tifosi"
+ */
+function cbWebEventToEntry(ev: import('./cloudbet-web-scraper.js').CbWebEvent) {
+  const parseTeam = (name: string): { team: string; player: string } => {
+    const m = name.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+    if (m) return { team: m[1].trim(), player: m[2].trim() };
+    return { team: name.trim(), player: '' };
+  };
+
+  const home = parseTeam(ev.homeTeam);
+  const away = parseTeam(ev.awayTeam);
+  if (!home.player || !away.player) return null;  // player név kell
+
+  // startTime UTC ISO → Budapest CEST (UTC+2) → "HH:MM" és "MM/DD"
+  const utcMs  = new Date(ev.startTime).getTime();
+  const cestMs = utcMs + 2 * 3600 * 1000;
+  const d      = new Date(cestMs);
+  const time   = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+  const date   = `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`;
+
+  return {
+    playerHome: home.player,
+    playerAway: away.player,
+    teamHome:   home.team,
+    teamAway:   away.team,
+    league:     ev.league,
+    time,
+    date,
+    startTime:  utcMs,
+    eventId:    String(ev.id),
+  };
+}
 
 /** Combined schedule: esoccerbet.org + TotalCorner-only leagues (upcoming only) */
 async function getCombinedSchedule() {
-  const [esbResult, h2hResult] = await Promise.allSettled([
+  const [esbResult, h2hResult, voltaResult, cloudbetResult, gtTcResult, cbWebResult, vpsResult] = await Promise.allSettled([
     esbScrapeSchedule(),
     tcScrapeSchedule('Esoccer H2H GG League'),
+    tcScrapeSchedule('Esports Volta'),
+    getCloudbetKeyStatus().configured ? getCloudbetSchedule() : Promise.resolve([]),
+    scrapeTCLeague('GT Leagues'),
+    getCloudbetWebSchedule(),
+    getVpsSchedule(),  // ← Hetzner VPS scraper (GT + ADR, IP-block mentes)
   ]);
-  const esb = esbResult.status === 'fulfilled' ? esbResult.value : [];
-  const h2hRaw = h2hResult.status === 'fulfilled' ? h2hResult.value : [];
 
-  // TotalCorner returns the full 48h window — keep only upcoming/live matches.
-  // TC times are in CET (UTC+1, no DST). Compare against UTC to stay correct
-  // when Budapest is on CEST (UTC+2) in summer.
-  const h2h = h2hRaw.filter(m => {
-    // Drop matches with actual goals (score > 0 means completed)
-    const hasScore = m.scoreHome !== undefined && m.scoreAway !== undefined
-      && (m.scoreHome > 0 || m.scoreAway > 0);
-    if (hasScore) return false;
-    // Convert TC's CET time (UTC+1) to UTC minutes, compare to now UTC
-    const [mH, mM] = (m.time || '00:00').split(':').map(Number);
-    const matchUTCMinutes = mH * 60 + mM - 60; // CET → UTC
-    const now = new Date();
-    const nowUTCMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
-    // Normalise day boundary
-    let diff = matchUTCMinutes - nowUTCMinutes;
-    if (diff < -720) diff += 1440;
-    if (diff > 720) diff -= 1440;
-    return diff >= -10; // keep upcoming + in-progress (≤10 min since kick-off)
-  });
+  const esbAll      = esbResult.status      === 'fulfilled' ? esbResult.value      : [];
+  const esb         = esbAll.filter(e => e.league !== 'eAdriatic League');
+  const h2hRaw      = h2hResult.status      === 'fulfilled' ? h2hResult.value      : [];
+  const voltaRaw    = voltaResult.status    === 'fulfilled' ? voltaResult.value    : [];
+  const cloudbetRaw = cloudbetResult.status === 'fulfilled' ? cloudbetResult.value : [];
+  const gtTcData    = gtTcResult.status     === 'fulfilled' ? gtTcResult.value     : null;
+  const cbWebRaw    = cbWebResult.status    === 'fulfilled' ? cbWebResult.value    : [];
+  const vpsRaw      = vpsResult.status      === 'fulfilled' ? vpsResult.value      : [];
 
-  return [...esb, ...h2h];
+  const gtTcEntries = (gtTcData?.fixtures ?? [])
+    .map(f => tcFixtureToEntry(f, 'GT Leagues'))
+    .filter((e): e is NonNullable<ReturnType<typeof tcFixtureToEntry>> => e !== null);
+
+  const cbWebEntries = cbWebRaw
+    .map(ev => cbWebEventToEntry(ev))
+    .filter((e): e is NonNullable<ReturnType<typeof cbWebEventToEntry>> => e !== null);
+
+  // VPS entries: közvetlenül használható formátum
+  // _fromVps=true jelölő: Render-en az IP-block ellenére is megjelennek (estimated odds-szal is)
+  const vpsEntries = vpsRaw
+    .filter((e: any) => e.playerHome && e.playerAway && e.league)
+    .map((e: any) => ({ ...e, _fromVps: true }));
+
+  const cbWebGT       = cbWebEntries.filter(e => e.league === 'GT Leagues');
+  const cbWebAdriatic = cbWebEntries.filter(e => e.league === 'eAdriatic League');
+
+  // Deduplikálás — prioritás: VPS > Cloudbet Web > Cloudbet API > TC > esb
+  const allKeys = new Set<string>();
+
+  // 1. VPS (Hetzner) — elsődleges Render-en (nincs IP-block)
+  vpsEntries.forEach((m: any) => allKeys.add(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+
+  // 2. Cloudbet Web (lokálisan működik, Render-en lehet blokkolva)
+  cbWebEntries
+    .filter(m => !allKeys.has(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`))
+    .forEach(m => allKeys.add(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+
+  // 3. Cloudbet API (authenticated) — csak eAdriatic
+  const cloudbetOnly = cloudbetRaw.filter(
+    m => !allKeys.has(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`),
+  );
+  cloudbetOnly.forEach(m => allKeys.add(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+
+  // GT: TC deduplikálva
+  const gtTcOnly = gtTcEntries.filter(
+    m => !allKeys.has(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`),
+  );
+  gtTcOnly.forEach(m => allKeys.add(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+
+  // GT: esb utolsó fallback
+  const esbGT = esb.filter(e => e.league === 'GT Leagues'
+    && !allKeys.has(`${e.playerHome.toLowerCase()}|${e.playerAway.toLowerCase()}`),
+  );
+  const esbOther = esb.filter(e => e.league !== 'GT Leagues');
+
+  // cbWeb GT + ADR deduplikálva az allKeys-szel (VPS már benne van → csak a különbség kerül be)
+  const cbWebGTDeduped  = cbWebGT.filter(m => !allKeys.has(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+  const cbWebADRDeduped = cbWebAdriatic.filter(m => !allKeys.has(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+  cbWebGTDeduped.forEach(m => allKeys.add(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+  cbWebADRDeduped.forEach(m => allKeys.add(`${m.playerHome.toLowerCase()}|${m.playerAway.toLowerCase()}`));
+
+  const cbApiGT  = cloudbetOnly.filter(m => m.league === 'GT Leagues').length;
+  const cbApiAdr = cloudbetOnly.filter(m => m.league === 'eAdriatic League').length;
+  const vpsGT  = vpsEntries.filter((m: any) => m.league === 'GT Leagues').length;
+  const vpsAdr = vpsEntries.filter((m: any) => m.league === 'eAdriatic League').length;
+  console.log(`[schedule] VPS: GT=${vpsGT} eAdr=${vpsAdr} | CbWeb fallback: GT=${cbWebGTDeduped.length} eAdr=${cbWebADRDeduped.length} | CbAPI: eAdr=${cbApiAdr} | TC GT: ${gtTcOnly.length} | esb GT: ${esbGT.length}`);
+
+  return [
+    ...esbOther,
+    ...vpsEntries,                          // VPS elsődleges (GT + ADR)
+    ...cbWebGTDeduped,                      // Cloudbet Web fallback GT (csak VPS-ben nem szereplők)
+    ...cbWebADRDeduped,                     // Cloudbet Web fallback ADR (csak VPS-ben nem szereplők)
+    ...cloudbetOnly,                        // Cloudbet API ADR
+    ...filterTCSchedule(gtTcOnly),          // TC GT fallback
+    ...esbGT,                               // ESB GT utolsó fallback
+    ...filterTCSchedule(h2hRaw.map(shiftTCTime)),
+    ...filterTCSchedule(voltaRaw.map(shiftTCTime)),
+  ];
+}
+
+// ── Sticky buffer: keep GT Leagues match cards for 3 min after scheduled start ──
+type ScheduleEntry = Awaited<ReturnType<typeof getCombinedSchedule>>[number];
+const stickyBuffer = new Map<string, { entry: ScheduleEntry; startMs: number }>();
+
+function updateStickyBuffer(schedule: ScheduleEntry[]) {
+  const now = Date.now();
+  const today = new Date();
+  const dayBase = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const STICKY_LEAGUES = new Set(['GT Leagues', 'Esoccer H2H GG League', 'Esports Volta']);
+  for (const entry of schedule) {
+    if (!STICKY_LEAGUES.has(entry.league)) continue;
+    const key = `${entry.playerHome}|${entry.playerAway}|${entry.time}`;
+    if (!stickyBuffer.has(key)) {
+      const [h, m] = (entry.time || '00:00').split(':').map(Number);
+      stickyBuffer.set(key, { entry, startMs: dayBase + h * 3600000 + m * 60000 });
+    }
+  }
+  // Clean entries older than 5 min past start
+  for (const [key, { startMs }] of stickyBuffer) {
+    if (now - startMs > 5 * 60 * 1000) stickyBuffer.delete(key);
+  }
+}
+
+function applySticky(schedule: ScheduleEntry[]): ScheduleEntry[] {
+  const now = Date.now();
+  const currentKeys = new Set(schedule.map(e => `${e.playerHome}|${e.playerAway}|${e.time}`));
+  const extra: ScheduleEntry[] = [];
+  for (const [, { entry, startMs }] of stickyBuffer) {
+    if (currentKeys.has(`${entry.playerHome}|${entry.playerAway}|${entry.time}`)) continue;
+    const msPastStart = now - startMs;
+    if (msPastStart >= 0 && msPastStart <= 3 * 60 * 1000) extra.push(entry);
+  }
+  return extra.length > 0 ? [...schedule, ...extra] : schedule;
 }
 
 /** Promise-based cache for TC bulk player data (prevents parallel fetches) */
@@ -84,11 +472,47 @@ async function getTCPlayerBulk(league: TotalCornerLeague) {
   return p;
 }
 
-/** Convert TotalCornerPlayer → PlayerStats for TC-only leagues */
+/** Convert TotalCornerPlayer → PlayerStats for TC-only leagues.
+ *  Builds per-match history from the TC schedule (which contains full results history).
+ */
 async function getPlayerStatsTC(playerName: string, league: TotalCornerLeague): Promise<PlayerStats> {
-  const bulk = await getTCPlayerBulk(league);
-  const p = bulk.find(pl => pl.name.toLowerCase() === playerName.toLowerCase());
+  const pNameLow = playerName.toLowerCase();
+
+  const [bulk, fullSchedule] = await Promise.all([
+    getTCPlayerBulk(league),
+    cached(`tc:full-schedule:${league}`, () => tcScrapeSchedule(league)),
+  ]);
+
+  const p = bulk.find(pl => pl.name.toLowerCase() === pNameLow);
   if (!p) throw new Error(`Player ${playerName} not found in TC ${league}`);
+
+  // Build per-match history from the TC schedule (completed matches = both scores defined)
+  const lastMatches = fullSchedule
+    .filter(m =>
+      m.scoreHome !== undefined && m.scoreAway !== undefined &&
+      (m.playerHome.toLowerCase() === pNameLow || m.playerAway.toLowerCase() === pNameLow)
+    )
+    .map(m => {
+      const isHome = m.playerHome.toLowerCase() === pNameLow;
+      const gf = isHome ? (m.scoreHome ?? 0) : (m.scoreAway ?? 0);
+      const ga = isHome ? (m.scoreAway ?? 0) : (m.scoreHome ?? 0);
+      return {
+        date: m.time ? `${m.date} ${m.time}` : m.date,
+        opponent: isHome ? m.playerAway : m.playerHome,
+        team: isHome ? m.teamHome : m.teamAway,
+        opponentTeam: isHome ? m.teamAway : m.teamHome,
+        result: (gf > ga ? 'win' : gf < ga ? 'loss' : 'draw') as 'win' | 'loss' | 'draw',
+        scoreHome: gf,
+        scoreAway: ga,
+      };
+    })
+    .slice(0, 20); // TC table is already newest-first
+
+  // Recent form delta vs season average
+  const last10 = lastMatches.slice(0, 10);
+  const recentWR = last10.length > 0 ? last10.filter(m => m.result === 'win').length / last10.length : p.winRate;
+  const form10 = recentWR - p.winRate;
+
   return {
     name: p.name,
     league,
@@ -102,19 +526,63 @@ async function getPlayerStatsTC(playerName: string, league: TotalCornerLeague): 
     goalDiff: p.gf - p.ga,
     gfPerMatch: p.avgGF,
     gaPerMatch: p.avgGA,
-    form10: 0,
+    form10,
     form50: 0,
     form200: 0,
     bttsYes: 0.5,
     ouStats: p.ouStats,
-    lastMatches: [],
+    lastMatches,
   };
 }
 
-/** Unified player stats: esoccerbet.org or TC fallback */
+/** Unified player stats: msport (GT/eAdriatic), TC (H2H GG) vagy esoccerbet fallback */
 async function getPlayerStats(playerName: string, league: string): Promise<PlayerStats> {
   if (TC_ONLY_LEAGUES.has(league)) {
     return getPlayerStatsTC(playerName, league as TotalCornerLeague);
+  }
+  // GT Leagues + eAdriatic League → KIZÁRÓLAG msport.com
+  // esoccerbet.org teljesen kizárva ennél a két ligánál.
+  if (league === 'GT Leagues' || league === 'eAdriatic League') {
+    try {
+      const lastMatches = await getMsportPlayerLastMatches(playerName, league);
+      const total = lastMatches.length;
+      if (total > 0) {
+        const wins   = lastMatches.filter(m => m.result === 'win').length;
+        const draws  = lastMatches.filter(m => m.result === 'draw').length;
+        const losses = lastMatches.filter(m => m.result === 'loss').length;
+        const winRate  = wins / total;
+        const gfTotal  = lastMatches.reduce((s, m) => s + m.scoreHome, 0);
+        const gaTotal  = lastMatches.reduce((s, m) => s + m.scoreAway, 0);
+        const last10 = lastMatches.slice(0, 10);
+        const wr10   = last10.length > 0 ? last10.filter(m => m.result === 'win').length / last10.length : winRate;
+        const ouLines = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5];
+        const ouStats = ouLines.map(line => {
+          const over = lastMatches.filter(m => m.scoreHome + m.scoreAway > line).length / total;
+          return { line: String(line), over, under: 1 - over };
+        });
+        return {
+          name: playerName, league,
+          matches: total, wins, draws, losses,
+          winRate, lossRate: losses / total, drawRate: draws / total,
+          goalDiff: gfTotal - gaTotal,
+          gfPerMatch: gfTotal / total, gaPerMatch: gaTotal / total,
+          form10: wr10 - winRate, form50: 0, form200: 0,
+          bttsYes: lastMatches.filter(m => m.scoreHome > 0 && m.scoreAway > 0).length / total,
+          ouStats, lastMatches,
+        };
+      }
+    } catch { /* silent */ }
+    // msport results üres (endpoint még nem elérhető) → alapértelmezett üres stats
+    return {
+      name: playerName, league,
+      matches: 0, wins: 0, draws: 0, losses: 0,
+      winRate: 0.5, lossRate: 0.25, drawRate: 0.25,
+      goalDiff: 0, gfPerMatch: 3.5, gaPerMatch: 3.5,
+      form10: 0, form50: 0, form200: 0,
+      bttsYes: 0.5,
+      ouStats: [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5].map(line => ({ line: String(line), over: 0.5, under: 0.5 })),
+      lastMatches: [],
+    };
   }
   return scrapePlayerStats(playerName, league);
 }
@@ -124,12 +592,66 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString(), node: process.version });
 });
 
+// Frontend config — exposes non-secret env vars to the React app at runtime
+app.get('/api/config', (_req, res) => {
+  res.json({
+    supabaseUrl: process.env.SUPABASE_URL ?? '',
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY ?? '',
+  });
+});
+
+// Delete the calling user's account (requires valid JWT in Authorization header)
+app.delete('/api/auth/delete-account', async (req, res) => {
+  const sb = supabase;
+  if (!sb) { res.status(503).json({ error: 'Supabase not configured' }); return; }
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) { res.status(401).json({ error: 'Missing token' }); return; }
+  try {
+    const { data: { user }, error: userErr } = await sb.auth.getUser(token);
+    if (userErr || !user) { res.status(401).json({ error: 'Invalid token' }); return; }
+    const { error } = await sb.auth.admin.deleteUser(user.id);
+    if (error) { res.status(500).json({ error: error.message }); return; }
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message ?? 'Unknown error' });
+  }
+});
+
+app.post('/api/cache/clear', (_req, res) => {
+  const before = cache.size;
+  cache.clear();
+  res.json({ cleared: before });
+});
+
 // Classify a bet into STRONG_BET / BET / NO_BET based on confidence + edge
 function classifyBet(confidence: number, edge: number, valueBet: string): 'STRONG_BET' | 'BET' | 'NO_BET' {
   if (valueBet === 'PASS') return 'NO_BET';
   if (confidence >= 0.80 && edge >= 0.08) return 'STRONG_BET';
   if (confidence >= 0.65 && edge >= 0.04) return 'BET';
   return 'NO_BET';
+}
+
+// Strategy-specific classification (uses custom thresholds from Strategy definition)
+function classifyBetWithStrategy(
+  confidence: number, edge: number, valueBet: string,
+  strategy: import('../src/model/strategies.js').Strategy
+): 'STRONG_BET' | 'BET' | 'NO_BET' {
+  if (valueBet === 'PASS') return 'NO_BET';
+  const sc = strategy.strongBetConf ?? 0.80;
+  const se = strategy.strongBetEdge ?? 0.08;
+  const bc = strategy.betConf ?? 0.65;
+  const be = strategy.betEdge ?? 0.04;
+  if (confidence >= sc && edge >= se) return 'STRONG_BET';
+  if (confidence >= bc && edge >= be) return 'BET';
+  return 'NO_BET';
+}
+
+// "MM/DD" today prefix for fatigue detection (matches lastMatches date format)
+function todayMMDD(): string {
+  const now = new Date();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  return `${mm}/${dd}`;
 }
 
 // Sanity check: edge > 50% is suspicious (likely data error or mispriced market)
@@ -166,6 +688,509 @@ app.get('/api/test-vegas', async (req, res) => {
   }
 });
 
+// Debug: raw TC schedule for H2H GG League (megmutatja van-e score a múltbeli meccseken)
+app.get('/api/debug-tc-schedule', async (req, res) => {
+  const league = (req.query.league as string) || 'Esoccer H2H GG League';
+  try {
+    const raw = await tcScrapeSchedule(league as TotalCornerLeague);
+    const withScore = raw.filter(m => m.scoreHome !== undefined || m.scoreAway !== undefined);
+    const withoutScore = raw.filter(m => m.scoreHome === undefined && m.scoreAway === undefined);
+    res.json({
+      total: raw.length,
+      withScore: withScore.length,
+      withoutScore: withoutScore.length,
+      sampleWithScore: withScore.slice(0, 5),
+      sampleWithoutScore: withoutScore.slice(0, 5),
+      serverLocalTime: new Date().toLocaleString('hu-HU'),
+      serverUTCTime: new Date().toUTCString(),
+    });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/msport-odds — msport.com O/U odds (GT Leagues + eAdriatic League)
+app.get('/api/msport-odds', async (_req, res) => {
+  try {
+    const odds = await getMsportOdds();
+    res.json(odds);
+  } catch {
+    res.json([]);
+  }
+});
+
+// GET /api/msport-debug — nyers msport.com API válasz (fejlesztéshez)
+app.get('/api/msport-debug', async (_req, res) => {
+  try {
+    const raw = await getMsportRawDebug();
+    res.json(raw);
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-debug — Cloudbet API teszt
+app.get('/api/cloudbet-debug', async (_req, res) => {
+  try {
+    const result = await testCloudbetApi();
+    res.json(result);
+  } catch (e: unknown) {
+    res.json({ ok: false, error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-status — API kulcs állapota
+app.get('/api/cloudbet-status', (_req, res) => {
+  res.json(getCloudbetKeyStatus());
+});
+
+// GET /api/cloudbet-raw — nyers API válasz debug (sport lista + competition próbák)
+app.get('/api/cloudbet-raw', async (_req, res) => {
+  const rawKey = process.env.CLOUDBET_API_KEY || '';
+  // Idézőjelek eltávolítása, ha valaki mégis beletette
+  const key = rawKey.replace(/^["']|["']$/g, '').trim();
+
+  const keyInfo = {
+    length: key.length,
+    first8: key.slice(0, 8),
+    last8: key.slice(-8),
+    hasQuotes: rawKey !== key,
+    startsWithEyJ: key.startsWith('eyJ'),
+  };
+  console.log(`[cloudbet-raw] kulcs info:`, keyInfo);
+
+  const ax = (await import('axios')).default;
+  const results: Record<string, any> = { keyInfo };
+
+  // Header variációk kipróbálása
+  const headerVariants = [
+    { label: 'X-API-Key', headers: { 'X-API-Key': key, 'Accept': 'application/json' } },
+    { label: 'Authorization Bearer', headers: { 'Authorization': `Bearer ${key}`, 'Accept': 'application/json' } },
+    { label: 'X-API-Key + Content-Type', headers: { 'X-API-Key': key, 'Accept': 'application/json', 'Content-Type': 'application/json' } },
+  ];
+
+  results.sports_attempts = {};
+  for (const v of headerVariants) {
+    try {
+      const r = await ax.get('https://sports-api.cloudbet.com/pub/v2/odds/sports', {
+        headers: v.headers, timeout: 8_000,
+      });
+      results.sports_attempts[v.label] = {
+        status: 'ok',
+        sportCount: Array.isArray(r.data?.sports) ? r.data.sports.length : '?',
+        data: r.data,
+      };
+      // Ha valamelyik működik, ne próbáljuk tovább
+      break;
+    } catch (e: any) {
+      results.sports_attempts[v.label] = { status: e.response?.status ?? 'error', msg: e.message };
+    }
+  }
+
+  // Ha valamelyik sports kérés OK volt, próbáljuk az esport-fifa kompetíciókat
+  const workingVariant = headerVariants.find(v => results.sports_attempts[v.label]?.status === 'ok');
+  if (workingVariant) {
+    try {
+      const r = await ax.get('https://sports-api.cloudbet.com/pub/v2/odds/sports/esport-fifa', {
+        headers: workingVariant.headers, timeout: 8_000,
+      });
+      results.esport_fifa = r.data;
+    } catch (e: any) {
+      results.esport_fifa_error = e.message;
+    }
+  }
+
+  res.json(results);
+});
+
+// GET /api/cloudbet-competitions — listázza az összes esport-fifa versenyt (key-kereséshez)
+app.get('/api/cloudbet-competitions', async (_req, res) => {
+  try {
+    const competitions = await listCloudbetCompetitions();
+    res.json({ count: competitions.length, competitions });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-discover — részletes verseny-lista event számokkal
+app.get('/api/cloudbet-discover', async (_req, res) => {
+  try {
+    const competitions = await discoverCloudbetCompetitions();
+    res.json({ count: competitions.length, competitions });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// ── Cloudbet belső Web API (kulcs nélkül!) ────────────────────────────────────
+
+// GET /api/cloudbet-web-schedule?league=eAdriatic+League — menetrend (belső API)
+app.get('/api/cloudbet-web-schedule', async (req, res) => {
+  try {
+    const league = req.query.league as string | undefined;
+    const events = await getCloudbetWebSchedule(league);
+    res.json({ count: events.length, events });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-web-live?league=eAdriatic+League — élő eredmények
+app.get('/api/cloudbet-web-live', async (req, res) => {
+  try {
+    const league = req.query.league as string | undefined;
+    const scores = await getCloudbetWebLiveScores(league);
+    res.json({ count: scores.length, scores });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-web-results?league=eAdriatic+League — befejezett meccsek (H2H DB)
+app.get('/api/cloudbet-web-results', async (req, res) => {
+  try {
+    const league = req.query.league as string | undefined;
+    const results = await getCloudbetWebResults(league);
+    res.json({ count: results.length, results: results.slice(0, 50) });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-web-h2h?teamA=...&teamB=...&league=...&days=30 — H2H adatok
+app.get('/api/cloudbet-web-h2h', async (req, res) => {
+  try {
+    const teamA  = (req.query.teamA  as string) || '';
+    const teamB  = (req.query.teamB  as string) || '';
+    const league = req.query.league  as string | undefined;
+    const days   = parseInt(req.query.days as string || '30');
+    const matches = await getCloudbetWebH2H(teamA, teamB, league, days);
+    res.json({ count: matches.length, matches });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-web-all — összes event (debug)
+app.get('/api/cloudbet-web-all', async (_req, res) => {
+  try {
+    const events = await getCloudbetWebAllEvents();
+    res.json({ count: events.length, events });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/cloudbet-web-h2h-stats — H2H DB státusza
+app.get('/api/cloudbet-web-h2h-stats', async (_req, res) => {
+  try {
+    const stats = getCloudbetWebH2HStats();
+    res.json(stats);
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// POST /api/cloudbet-web-clear — cache törlés
+app.post('/api/cloudbet-web-clear', (_req, res) => {
+  clearCloudbetWebCache();
+  res.json({ ok: true });
+});
+
+// GET /api/msport-results-debug — lezárt meccsek eredménye (fejlesztéshez)
+// Megmutatja melyik endpoint működik és hány meccs jött vissza.
+app.get('/api/msport-results-debug', async (_req, res) => {
+  try {
+    const results = await getMsportMatchResults();
+    res.json({
+      total: results.length,
+      gt: results.filter(r => r.league === 'GT Leagues').length,
+      eAdriatic: results.filter(r => r.league === 'eAdriatic League').length,
+      sample: results.slice(0, 5),
+    });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/accum-debug — score accumulator állapota (fejlesztéshez)
+// Megmutatja hány meccs van a dailyMatchMap-ben, hány lett már lezárva,
+// hány fog kelleni a pollhoz, és az utolsó injektált eredmények.
+app.get('/api/accum-debug', async (_req, res) => {
+  try {
+    const now = Date.now();
+    const BUFFER_AFTER  =  2 * 60 * 1000;
+    const GIVE_UP_AFTER = 35 * 60 * 1000;
+    const all = Array.from(dailyMatchMap.values());
+    const toCheck = all.filter(m => {
+      if (_completedEventIds.has(m.eventId)) return false;
+      const duration = MATCH_DURATION_MS[m.league] ?? 12 * 60 * 1000;
+      const elapsed = now - m.startTime;
+      return elapsed >= (duration + BUFFER_AFTER) && elapsed <= (duration + GIVE_UP_AFTER);
+    });
+    const results = await getMsportMatchResults();
+    res.json({
+      dailyMapSize: all.length,
+      completedInjected: _completedEventIds.size,
+      pendingCheck: toCheck.length,
+      toCheckSample: toCheck.slice(0, 5).map(m => ({
+        playerA: m.playerA, playerB: m.playerB, league: m.league,
+        startedMinsAgo: Math.round((now - m.startTime) / 60000),
+      })),
+      totalResultsAvailable: results.length,
+      gtResults: results.filter(r => r.league === 'GT Leagues').length,
+      eAdriaticResults: results.filter(r => r.league === 'eAdriatic League').length,
+      lastInjected: results
+        .sort((a, b) => b.startTime - a.startTime)
+        .slice(0, 10)
+        .map(r => ({ playerA: r.playerA, scoreA: r.scoreA, scoreB: r.scoreB, playerB: r.playerB, league: r.league, date: r.date })),
+    });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// POST /api/msport-cookie — msport.com session cookie beállítása (DevTools-ból másolva)
+// Body: { "cookie": "cookie1=val1; cookie2=val2; ..." }
+app.post('/api/msport-cookie', (req, res) => {
+  const { cookie } = req.body as { cookie?: string };
+  if (!cookie || typeof cookie !== 'string' || cookie.trim().length < 5) {
+    res.status(400).json({ error: 'Hiányzó vagy érvénytelen cookie string' });
+    return;
+  }
+  setMsportCookie(cookie);
+  clearFixtureCache(); // fixture cache törlése az új cookie-val való frissítéshez
+  res.json({ ok: true, length: cookie.trim().length, msg: 'Cookie beállítva. Cache törölve, következő lekérésnél az új cookie lesz használva.' });
+});
+
+// GET /api/msport-fixture-debug — fixture oldal scraper teszt (fejlesztéshez)
+// Megmutatja hány meccset sikerült parsoni az msport fixture oldaláról.
+app.get('/api/msport-fixture-debug', async (_req, res) => {
+  try {
+    clearFixtureCache(); // mindig friss lekérés debug-nál
+    const data = await scrapeMsportFixtures();
+    res.json({
+      count: data.length,
+      gt: data.filter(r => r.league === 'GT Leagues').length,
+      eAdriatic: data.filter(r => r.league === 'eAdriatic League').length,
+      sample: data.slice(0, 15),
+      msg: data.length === 0
+        ? '⚠️ Az API nem adott vissza adatot. Ellenőrizd a cookie-t vagy próbáld újra!'
+        : `✅ ${data.length} meccs sikeresen beolvasva (utolsó 14 nap)`,
+    });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown', count: 0 });
+  }
+});
+
+// GET /api/msport-fixture-raw — fixture oldal nyers HTML-je (fejlesztéshez)
+// Megmutatja az oldal HTML struktúráját, hogy a parsert finomíthassuk.
+app.get('/api/msport-fixture-raw', async (_req, res) => {
+  try {
+    const axios_ = await import('axios');
+    const { default: axios } = axios_;
+    const resp = await axios.get('https://www.msport.com/gh/web/my_matches/fixture?tab=sr:sport:137', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Referer': 'https://www.msport.com/',
+      },
+      timeout: 15_000,
+      responseType: 'text',
+    });
+    const html = resp.data as string;
+    res.json({
+      status: resp.status,
+      contentType: resp.headers['content-type'],
+      htmlLength: html.length,
+      // Az első 8000 karakter — elegendő a struktúra megértéséhez
+      preview: html.slice(0, 8000),
+      // Keresünk "vs" szövegre a HTML-ben — megmutatja van-e meccs adat
+      vsOccurrences: (html.match(/ vs /gi) || []).length,
+      // Zárójelek száma — játékosneveket jelöl
+      parenOccurrences: (html.match(/\([A-Z][a-z]+\)/g) || []).length,
+    });
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/msport-cookie — aktuális cookie státusz
+app.get('/api/msport-cookie', (_req, res) => {
+  res.json(getMsportCookieStatus());
+});
+
+// GET /api/debug-schedule — megmutatja mit lát a szerver a schedule-ból
+app.get('/api/debug-schedule', async (_req, res) => {
+  try {
+    const schedule = await getCombinedSchedule();
+    const byLeague: Record<string, number> = {};
+    for (const m of schedule) { byLeague[m.league] = (byLeague[m.league] || 0) + 1; }
+    res.json({
+      total: schedule.length,
+      byLeague,
+      eAdriaticSample: schedule.filter(m => m.league === 'eAdriatic League').slice(0, 5),
+      gtSample: schedule.filter(m => m.league === 'GT Leagues').slice(0, 5),
+      msportOdds: await getMsportOdds(),
+    });
+  } catch (e: unknown) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/live-scores — élő meccsek gólállása + menetideje
+// Forrás 1: Altenar/vegas.hu    → GT Leagues
+// Forrás 2: msport detail API   → eAdriatic League (+ GT fallback)
+// Forrás prioritás: Altenar (GT) > msport > Cloudbet Feed API (GT+ADR) > Cloudbet Web
+// Live-scores 8s TTL cache — kliens 10s pollol, multi-user dedupot ad.
+// In-flight Promise tárolása: cache miss esetén több párhuzamos kérés
+// csak EGY fan-out-ot indít, a többi ugyanarra a Promise-ra vár.
+let _liveScoresCache: { ts: number; data: any[] } | null = null;
+let _liveScoresInflight: Promise<any[]> | null = null;
+const LIVE_SCORES_TTL_MS = 8_000;
+
+app.get('/api/live-scores', async (_req, res) => {
+  const now = Date.now();
+  if (_liveScoresCache && (now - _liveScoresCache.ts) < LIVE_SCORES_TTL_MS) {
+    return res.json(_liveScoresCache.data);
+  }
+  if (_liveScoresInflight) {
+    try { return res.json(await _liveScoresInflight); }
+    catch { return res.json([]); }
+  }
+  _liveScoresInflight = (async () => {
+    // 1. Altenar live scores (GT Leagues) — startDate alapú perc (sc mező megbízhatatlan)
+    const altenarScores = await getAllLiveScores().catch(() => []);
+
+    // 2. msport live scores — csak az éppen futó meccsekre
+    const now = Date.now();
+    const MAX_MATCH_MS = 15 * 60 * 1000;
+    const liveEventIds = Array.from(dailyMatchMap.values())
+      .filter(m => { const e = now - m.startTime; return e >= 0 && e <= MAX_MATCH_MS; })
+      .map(m => m.eventId);
+    const msportScores = liveEventIds.length > 0
+      ? await getMsportLiveScores(liveEventIds).catch(() => [])
+      : [];
+
+    // 3. Cloudbet Feed API live scores (GT + eAdriatic, API kulccsal)
+    //    TRADING_LIVE státuszú meccseket adja vissza.
+    //    Ha a Feed API nem adja a score-t (scoreKnown=false), egyedi web API lekérésből pótoljuk.
+    const cbApiLive = await getCloudbetApiLiveScores().catch(() => []);
+
+    // Gazdagítás: minden scoreKnown=false eseménynél próbálunk valódi gólokat lekérni
+    const cbApiEnriched = await Promise.all(cbApiLive.map(async s => {
+      if (s.scoreKnown && (s.scoreA > 0 || s.scoreB > 0)) return s;
+      // Egyedi event lekérése a Cloudbet web belső API-ból (metadata.score tartalmazza a gólokat)
+      const webEv = await fetchSingleEvent(s.eventId).catch(() => null);
+      if (webEv && webEv.homeScore !== undefined) {
+        return { ...s, scoreA: webEv.homeScore, scoreB: webEv.awayScore ?? 0, scoreKnown: true };
+      }
+      return s;
+    }));
+
+    const cbApiConverted = cbApiEnriched.map(s => ({
+      playerA: s.playerA, playerB: s.playerB,
+      teamA: s.teamA, teamB: s.teamB,
+      scoreA: s.scoreA, scoreB: s.scoreB,
+      matchTime: `${s.minute}'`,
+      minute: s.minute,
+      periodName: s.periodName,
+      isLive: true,
+      league: s.league,
+      source: 'cloudbet-api',
+    }));
+
+    // 4. Cloudbet Web belső API — egyedi event lekérések (metadata.score = valódi gólok)
+    //    Elsősorban ADR meccsekhez, ahol a többi forrás 0:0-t ad
+    const cbWebRaw = await getCloudbetWebLiveScores().catch(() => []);
+    const cbWebConverted = cbWebRaw.map(s => {
+      const elapsedSec = s.matchTimeSeconds > 0 ? s.matchTimeSeconds
+        : Math.max(0, Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 1000));
+      const minute = Math.min(Math.floor(elapsedSec / 60), 12);
+      return {
+        playerA: s.homeTeam,
+        playerB: s.awayTeam,
+        teamA: s.homeTeam,
+        teamB: s.awayTeam,
+        scoreA: s.homeScore,
+        scoreB: s.awayScore,
+        matchTime: `${minute}'`,
+        minute,
+        periodName: elapsedSec <= 360 ? '1. félidő' : '2. félidő',
+        isLive: true,
+        league: s.league,
+        source: 'cloudbet-web',
+      };
+    });
+
+    // Összefűzés — Altenar > msport > Cloudbet Feed API > Cloudbet Web (deduplikálás)
+    const lkey = (s: { playerA: string; playerB: string }) =>
+      `${s.playerA.toLowerCase()}|${s.playerB.toLowerCase()}`;
+
+    const altenarKeys = new Set(altenarScores.map(lkey));
+    const msportOnly = msportScores.filter(s => !altenarKeys.has(lkey(s)));
+    const existingKeys = new Set([...altenarScores.map(lkey), ...msportOnly.map(lkey)]);
+    const cbApiOnly = cbApiConverted.filter(s => !existingKeys.has(lkey(s)));
+    const cbApiKeys = new Set([...existingKeys, ...cbApiOnly.map(lkey)]);
+
+    // cbWebConverted: ha van score (homeScore > 0 VAGY kiderítettük hogy 0:0 valóban az),
+    // felülírjuk a cbApi 0:0-s bejegyzéseit, mert a Web API pontosabb gólokat ad
+    const cbWebOnly: typeof cbWebConverted = [];
+    for (const ws of cbWebConverted) {
+      const k = lkey(ws);
+      if (!altenarKeys.has(k) && !new Set(msportOnly.map(lkey)).has(k)) {
+        // Ha a cbApi már tartalmazza DE 0:0 a score és a cbWeb nem 0:0, cseréljük
+        const cbApiEntry = cbApiOnly.find(a => lkey(a) === k);
+        if (cbApiEntry) {
+          if (cbApiEntry.scoreA === 0 && cbApiEntry.scoreB === 0 &&
+              (ws.scoreA > 0 || ws.scoreB > 0)) {
+            // Felülírjuk a cbApi bejegyzést a valódi gólokkal
+            cbApiEntry.scoreA = ws.scoreA;
+            cbApiEntry.scoreB = ws.scoreB;
+          }
+        } else if (!cbApiKeys.has(k)) {
+          cbWebOnly.push(ws);
+        }
+      }
+    }
+
+    console.log(`[live-scores] altenar:${altenarScores.length} msport:${msportOnly.length} cbApi:${cbApiOnly.length} cbWeb:${cbWebOnly.length}`);
+
+    return [...altenarScores, ...msportOnly, ...cbApiOnly, ...cbWebOnly];
+  })();
+
+  try {
+    const data = await _liveScoresInflight;
+    _liveScoresCache = { ts: Date.now(), data };
+    res.json(data);
+  } catch {
+    res.json([]);
+  } finally {
+    _liveScoresInflight = null;
+  }
+});
+
+// GET /api/debug-live — nyers Altenar live mezők (fejlesztéshez)
+app.get('/api/debug-live', async (_req, res) => {
+  try {
+    const raw = await getRawLiveDebug();
+    res.json(raw);
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
+// GET /api/debug-cloudbet-web — nyers Cloudbet Web events (fejlesztéshez)
+app.get('/api/debug-cloudbet-web', async (_req, res) => {
+  try {
+    const data = await getCloudbetWebDebugEvents();
+    res.json(data);
+  } catch (e: unknown) {
+    res.json({ error: e instanceof Error ? e.message : 'Unknown' });
+  }
+});
+
 // Test scraper connectivity
 app.get('/api/test-scrape', async (_req, res) => {
   try {
@@ -180,17 +1205,31 @@ app.get('/api/test-scrape', async (_req, res) => {
 });
 
 const cache = new Map<string, { data: unknown; ts: number }>();
-const CACHE_TTL = 3 * 60 * 1000;
+const cacheInFlight = new Map<string, Promise<unknown>>();
+const CACHE_TTL        = 3 * 60 * 1000;  // 3 perc — játékos stats, H2H, stb.
+const SCHEDULE_CACHE_TTL = 30_000;        // 30 mp — meccsrend (msport comingSoons gyorsan változik)
 
-function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+function cached<T>(key: string, fn: () => Promise<T>, ttl: number = CACHE_TTL): Promise<T> {
   const entry = cache.get(key);
-  if (entry && Date.now() - entry.ts < CACHE_TTL) {
+  if (entry && Date.now() - entry.ts < ttl) {
     return Promise.resolve(entry.data as T);
   }
-  return fn().then(data => {
-    cache.set(key, { data, ts: Date.now() });
-    return data;
-  });
+  // In-flight deduplication: párhuzamos hívások ne fussák le kétszer
+  const inflight = cacheInFlight.get(key);
+  if (inflight) return inflight as Promise<T>;
+
+  const promise = fn()
+    .then(data => {
+      cache.set(key, { data, ts: Date.now() });
+      cacheInFlight.delete(key);
+      return data;
+    })
+    .catch(e => {
+      cacheInFlight.delete(key);
+      throw e;
+    });
+  cacheInFlight.set(key, promise);
+  return promise;
 }
 
 app.get('/api/player/:name', async (req, res) => {
@@ -227,7 +1266,7 @@ app.get('/api/best-players', async (_req, res) => {
 app.get('/api/schedule', async (req, res) => {
   try {
     const league = req.query.league as string | undefined;
-    let data = await cached('schedule', getCombinedSchedule);
+    let data = await cached('schedule', getCombinedSchedule, SCHEDULE_CACHE_TTL);
     if (league) data = data.filter(m => m.league === league);
     res.json(data);
   } catch (e: unknown) {
@@ -544,28 +1583,59 @@ app.post('/api/auto-check', async (req, res) => {
 });
 
 // GET /api/top-tips?league=...&limit=5 - auto-scan schedule and return best value bets
+// ── Response cache: 60 másodpercig újrahasználja az előző scan eredményét ──────
+const _topTipsCache = new Map<string, { data: any; ts: number }>();
+const TOP_TIPS_CACHE_TTL = 60_000; // 60 másodperc
+const _topTipsInFlight = new Map<string, Promise<any>>();
+
 app.get('/api/top-tips', async (req, res) => {
+  // Scope-on kívül deklarálva, hogy a catch block is elérhesse
+  const leagueFilter = req.query.league as string | undefined;
+  const limit = Math.min(parseInt(req.query.limit as string) || 5, 20);
+  const strategyId = (req.query.strategy as string)?.toUpperCase() || 'A';
+  const selectedStrategy = STRATEGIES[strategyId] || STRATEGIES.A;
+  const minConf = parseFloat(req.query.minConf as string) || (selectedStrategy.betConf ?? 0.55);
+  const preferOdds2 = (['msport', 'cloudbet', 'vegas'].includes(req.query.preferOdds as string)
+    ? req.query.preferOdds as string : 'msport') as string;
+  const cacheKey = `${strategyId}|${leagueFilter ?? ''}|${limit}|${preferOdds2}`;
+  let _resolveInFlight: ((v: any) => void) | null = null;
+
   try {
-    const leagueFilter = req.query.league as string | undefined;
-    const limit = Math.min(parseInt(req.query.limit as string) || 5, 20);
-    const minConf = parseFloat(req.query.minConf as string) || 0.55;
-    const minEdge = parseFloat(req.query.minEdge as string) || 0.02;
-    const strategyId = (req.query.strategy as string)?.toUpperCase() || 'A';
-    const selectedStrategy = STRATEGIES[strategyId] || STRATEGIES.A;
+    // Cache hit → azonnali válasz, nincs scan
+    const cached60 = _topTipsCache.get(cacheKey);
+    if (cached60 && Date.now() - cached60.ts < TOP_TIPS_CACHE_TTL) {
+      res.json(cached60.data);
+      return;
+    }
+    // In-flight → várjuk meg a már futó scant (ne indítsunk párhuzamos scant)
+    if (_topTipsInFlight.has(cacheKey)) {
+      const result = await _topTipsInFlight.get(cacheKey)!;
+      res.json(result);
+      return;
+    }
+
+    // Regisztráljuk hogy fut a scan (a végén töröljük + cache-eljük)
+    const inFlightPromise = new Promise<any>(resolve => { _resolveInFlight = resolve; });
+    _topTipsInFlight.set(cacheKey, inFlightPromise);
+    const minEdge = parseFloat(req.query.minEdge as string) || (selectedStrategy.betEdge ?? 0.02);
+    // Preferált odds forrás — felhasználó választja a UI-ban
+    const preferOdds = (['msport', 'cloudbet', 'vegas'].includes(req.query.preferOdds as string)
+      ? req.query.preferOdds as string
+      : 'msport') as 'msport' | 'cloudbet' | 'vegas';
 
     console.log(`\n🎯 Strategy: ${selectedStrategy.name} (${selectedStrategy.id})`);
     console.log(`   Settings: WR=${selectedStrategy.settings.winRateSuly}, Forma=${selectedStrategy.settings.formaSuly}, H2H=${selectedStrategy.settings.h2hSuly}`);
-    // 1. Get schedule
-    let schedule = await cached('schedule', getCombinedSchedule);
+    // 1. Get schedule (+ keep GT Leagues cards visible 3 min after start)
+    let schedule = await cached('schedule', getCombinedSchedule, SCHEDULE_CACHE_TTL);
+    updateStickyBuffer(schedule);
+    schedule = applySticky(schedule);
     if (leagueFilter) schedule = schedule.filter(m => m.league === leagueFilter);
 
     // 1b. Load totalcorner fixtures for matchId lookup (per league)
-    // Map EsoccerBet league names to TC league names where applicable.
-    // Note: EsoccerBet "GT Leagues" and TC "Esoccer GT Leagues" are DIFFERENT leagues
-    // with different player rosters, so no mapping for that.
     const esbToTcLeague: Record<string, string> = {
       'Esoccer Battle': 'Esoccer Battle',
-      'Cyber Live Arena': 'Esoccer Adriatic League',
+      'eAdriatic League': 'Esoccer Adriatic League',
+      'GT Leagues': 'GT Leagues',   // TC ugyanilyen névvel ismeri (id=12985)
     };
     const tcFixturesByLeague = new Map<string, Map<string, string>>();
     // Map: ESB league -> "playerA|playerB" (both directions) -> matchId
@@ -609,6 +1679,7 @@ app.get('/api/top-tips', async (req, res) => {
       h2hSource: string;
       tcMatchId?: string;
       oddsSource: string;
+      oddsDiff?: number;
       oddsA: number;
       oddsB: number;
       oddsOver: number;
@@ -637,59 +1708,125 @@ app.get('/api/top-tips', async (req, res) => {
           const formToWinRate = (p: PlayerStats) => p.winRate > 0 ? p.winRate : (p.matches > 0 ? p.wins / p.matches : 0.5);
           const forma = (p: PlayerStats) => Math.max(0, Math.min(1, formToWinRate(p) + p.form10));
 
-          // === MULTI-SOURCE H2H (esoccerbet + totalcorner, weighted by recency) ===
+          // === H2H FORRÁS: Supabase completed_matches (elsődleges) ===
+          // Ha a Supabase-ben van elég adat → azt használjuk, scraper nem fut
+          // Ha nincs (új pár, vagy régi adat) → scraper fallback
 
-          // 1. Normalize esoccerbet H2H to common format
-          const esbH2H: NormalizedH2H[] = [];
-          const h2hFromA = a.lastMatches.filter(m => m.opponent.toLowerCase() === entry.playerAway.toLowerCase());
-          const h2hFromB = b.lastMatches.filter(m => m.opponent.toLowerCase() === entry.playerHome.toLowerCase());
-          for (const m of h2hFromA) {
-            esbH2H.push({ date: m.date, goalsA: m.scoreHome, goalsB: m.scoreAway, source: 'esoccerbet' });
-          }
-          for (const m of h2hFromB) {
-            esbH2H.push({ date: m.date, goalsA: m.scoreAway, goalsB: m.scoreHome, source: 'esoccerbet' });
-          }
+          const isMsportLeague = entry.league === 'GT Leagues' || entry.league === 'eAdriatic League';
 
-          // 2. Totalcorner fixture matchId lookup
-          const fixtureMap = tcFixturesByLeague.get(entry.league);
-          const tcMatchId = fixtureMap?.get(`${entry.playerHome.toLowerCase()}|${entry.playerAway.toLowerCase()}`);
-          let tcH2H: NormalizedH2H[] = [];
-          if (tcMatchId) {
-            try {
-              const tcRaw = await cached(`tc:h2h:${tcMatchId}`, () =>
-                scrapeTCH2H(tcMatchId, entry.playerHome, entry.playerAway)
-              );
-              tcH2H = normalizeTCH2H(tcRaw, entry.playerHome);
-            } catch {
-              // ignore
-            }
-          }
+          // 1. Supabase H2H lekérés — 10 perces cache (Supabase egress csökkentés)
+          const supabaseH2H = await cached(
+            `sbh2h:${entry.playerHome}:${entry.playerAway}:${entry.league}`,
+            () => getH2HFromSupabase(entry.playerHome, entry.playerAway, entry.league, 40),
+            10 * 60_000,
+          );
+          const hasSupabaseH2H = supabaseH2H.length >= 2;
 
           // H2H meccs-lista a kártyán való megjelenítéshez
-          const h2hMatchHistoryRaw: Array<{date: string; goalsA: number; goalsB: number; winner: 'A'|'B'|'draw'}> = [];
-          const seenH2HKeys = new Set<string>();
-          for (const m of h2hFromA) {
-            const key = `${m.date}|${m.scoreHome}-${m.scoreAway}`;
-            if (!seenH2HKeys.has(key)) {
-              seenH2HKeys.add(key);
-              h2hMatchHistoryRaw.push({ date: m.date, goalsA: m.scoreHome, goalsB: m.scoreAway,
-                winner: m.scoreHome > m.scoreAway ? 'A' : m.scoreHome < m.scoreAway ? 'B' : 'draw' });
-            }
-          }
-          for (const m of h2hFromB) {
-            const key = `${m.date}|${m.scoreAway}-${m.scoreHome}`;
-            if (!seenH2HKeys.has(key)) {
-              seenH2HKeys.add(key);
-              h2hMatchHistoryRaw.push({ date: m.date, goalsA: m.scoreAway, goalsB: m.scoreHome,
-                winner: m.scoreAway > m.scoreHome ? 'A' : m.scoreAway < m.scoreHome ? 'B' : 'draw' });
-            }
-          }
-          const h2hMatchHistory = h2hMatchHistoryRaw
-            .sort((x, y) => y.date.localeCompare(x.date))
-            .slice(0, 10);
+          let h2hMatchHistory: Array<{date: string; goalsA: number; goalsB: number; winner: 'A'|'B'|'draw'}>;
+          let primaryH2H: NormalizedH2H[];
+          let secondaryH2H: NormalizedH2H[] = [];
+          // Ezeket az if/else ELŐTT deklaráljuk, hogy az else blokkon kívül is elérhetők legyenek
+          let esbH2H: NormalizedH2H[] = [];
+          let tcH2H: NormalizedH2H[] = [];
+          let msportNormH2H: NormalizedH2H[] = [];
 
-          // 3. Merge + dedupe
-          const mergedH2H = mergeH2HSources(esbH2H, tcH2H);
+          if (hasSupabaseH2H) {
+            // ── Supabase elsődleges ──────────────────────────────────────────
+            h2hMatchHistory = supabaseH2H.slice(0, 20).map(m => ({
+              date: m.date, goalsA: m.goalsA, goalsB: m.goalsB, winner: m.winner,
+            }));
+            primaryH2H = supabaseH2H.map(m => ({
+              date: m.date, goalsA: m.goalsA, goalsB: m.goalsB, source: 'supabase' as any,
+            }));
+          } else {
+            // ── Scraper fallback (ha Supabase üres/kevés) ────────────────────
+            // msport H2H (GT + eAdriatic)
+            let msportH2HResult: Awaited<ReturnType<typeof getMsportH2H>> | null = null;
+            if (isMsportLeague) {
+              try {
+                msportH2HResult = await getMsportH2H(entry.playerHome, entry.playerAway, entry.league);
+              } catch { /* silent */ }
+            }
+
+            esbH2H = [];
+            const h2hFromA = a.lastMatches.filter(m => m.opponent.toLowerCase() === entry.playerAway.toLowerCase());
+            const h2hFromB = b.lastMatches.filter(m => m.opponent.toLowerCase() === entry.playerHome.toLowerCase());
+            if (!isMsportLeague) {
+              for (const m of h2hFromA) esbH2H.push({ date: m.date, goalsA: m.scoreHome, goalsB: m.scoreAway, source: 'esoccerbet' });
+              for (const m of h2hFromB) esbH2H.push({ date: m.date, goalsA: m.scoreAway, goalsB: m.scoreHome, source: 'esoccerbet' });
+            }
+
+            // TotalCorner H2H (a tcMatchId az else blokkon belül is meghatározható)
+            const fixtureMapH2H = tcFixturesByLeague.get(entry.league);
+            const tcMatchIdH2H = fixtureMapH2H?.get(`${entry.playerHome.toLowerCase()}|${entry.playerAway.toLowerCase()}`);
+            tcH2H = [];
+            if (tcMatchIdH2H) {
+              try {
+                const tcRaw = await cached(`tc:h2h:${tcMatchIdH2H}`, () =>
+                  scrapeTCH2H(tcMatchIdH2H, entry.playerHome, entry.playerAway)
+                );
+                tcH2H = normalizeTCH2H(tcRaw, entry.playerHome);
+              } catch { /* ignore */ }
+            }
+
+            msportNormH2H = (msportH2HResult?.matches ?? []).map(m => ({
+              date: m.date, goalsA: m.scoreA, goalsB: m.scoreB, source: 'msport' as any,
+            }));
+
+            // Megjelenítési lista — scraper alapján
+            if (isMsportLeague && (msportH2HResult?.matches.length ?? 0) > 0) {
+              h2hMatchHistory = msportH2HResult!.matches.map(m => ({
+                date: m.date, goalsA: m.scoreA, goalsB: m.scoreB,
+                winner: (m.resultA === 'win' ? 'A' : m.resultA === 'loss' ? 'B' : 'draw') as 'A'|'B'|'draw',
+              }));
+            } else if (tcH2H.length > 0) {
+              h2hMatchHistory = tcH2H.slice(0, 10).map(m => ({
+                date: m.date, goalsA: m.goalsA, goalsB: m.goalsB,
+                winner: (m.goalsA > m.goalsB ? 'A' : m.goalsA < m.goalsB ? 'B' : 'draw') as 'A'|'B'|'draw',
+              }));
+            } else {
+              const seen = new Set<string>();
+              const raw: typeof h2hMatchHistory = [];
+              for (const m of h2hFromA) {
+                const k = `${m.date}|${m.scoreHome}-${m.scoreAway}`;
+                if (!seen.has(k)) { seen.add(k); raw.push({ date: m.date, goalsA: m.scoreHome, goalsB: m.scoreAway, winner: m.scoreHome > m.scoreAway ? 'A' : m.scoreHome < m.scoreAway ? 'B' : 'draw' }); }
+              }
+              for (const m of h2hFromB) {
+                const k = `${m.date}|${m.scoreAway}-${m.scoreHome}`;
+                if (!seen.has(k)) { seen.add(k); raw.push({ date: m.date, goalsA: m.scoreAway, goalsB: m.scoreHome, winner: m.scoreAway > m.scoreHome ? 'A' : m.scoreAway < m.scoreHome ? 'B' : 'draw' }); }
+              }
+              h2hMatchHistory = raw.sort((x, y) => y.date.localeCompare(x.date)).slice(0, 10);
+            }
+
+            if (isMsportLeague) {
+              primaryH2H  = msportNormH2H.length > 0 ? msportNormH2H : tcH2H;
+            } else {
+              primaryH2H  = esbH2H;
+              secondaryH2H = tcH2H;
+            }
+          }
+
+          // TotalCorner fixture matchId (odds lekéréshez kell, H2H-tól függetlenül)
+          const fixtureMap = tcFixturesByLeague.get(entry.league);
+          const tcMatchId = fixtureMap?.get(`${entry.playerHome.toLowerCase()}|${entry.playerAway.toLowerCase()}`);
+
+          // 3. Merge + dedupe, H2H expiry szűrés stratégia szerint
+          const h2hExpiryDays = selectedStrategy.h2hExpiryDays ?? 365;
+          const mergedH2HRaw = mergeH2HSources(primaryH2H, secondaryH2H);
+          const cutoff = new Date();
+          cutoff.setDate(cutoff.getDate() - h2hExpiryDays);
+          const mergedH2H = mergedH2HRaw.filter(m => {
+            // m.date: "MM/DD HH:MM" formátum → parse mint idei/tavalyi dátum
+            if (!m.date) return true;
+            const parts = m.date.split(' ')[0].split('/'); // ["MM", "DD"]
+            if (parts.length < 2) return true;
+            const now = new Date();
+            let year = now.getFullYear();
+            const mDate = new Date(year, parseInt(parts[0]) - 1, parseInt(parts[1]));
+            if (mDate > now) mDate.setFullYear(year - 1); // ha jövőre mutat → tavaly
+            return mDate >= cutoff;
+          });
 
           // 4. Weighted aggregation (30-day half-life)
           const agg = aggregateH2HWeighted(mergedH2H, 30);
@@ -703,16 +1840,18 @@ app.get('/api/top-tips', async (req, res) => {
           const h2hOverRates = agg.total > 0 ? agg.overRates : undefined;
           const h2hEffectiveSize = agg.effectiveSize;
           const h2hSource =
-            tcH2H.length > 0 && esbH2H.length > 0 ? 'merged'
-              : tcH2H.length > 0 ? 'totalcorner'
-                : 'esoccerbet';
+            hasSupabaseH2H ? 'supabase'
+              : isMsportLeague && msportNormH2H.length > 0 ? 'msport.com'
+                : tcH2H.length > 0 && esbH2H.length > 0 ? 'merged'
+                  : tcH2H.length > 0 ? 'totalcorner'
+                    : 'esoccerbet';
 
           const h2hRatioA = h2hTotal > 0 ? (h2hWinsA + h2hDraws * 0.5) / h2hTotal : 0.5;
 
           const liga = entry.league === 'GT Leagues' ? 'GT Leagues' as const
-            : entry.league === 'Cyber Live Arena' ? 'eAdriaticLeague' as const
+            : entry.league === 'eAdriatic League' ? 'eAdriaticLeague' as const
               : 'Other' as const;
-          const percek = entry.league === 'GT Leagues' ? 12 : entry.league === 'Cyber Live Arena' ? 10 : (entry.league === 'Esoccer Battle' || entry.league === 'Esoccer H2H GG League') ? 8 : 6;
+          const percek = entry.league === 'GT Leagues' ? 12 : entry.league === 'eAdriatic League' ? 10 : (entry.league === 'Esoccer Battle' || entry.league === 'Esoccer H2H GG League') ? 8 : 6; // Esports Volta = 6
 
           // Try to get real odds, goal line, and movement from totalcorner
           let realOddsA: number | undefined;
@@ -761,26 +1900,93 @@ app.get('/api/top-tips', async (req, res) => {
             }
           }
 
-          // Vegas.hu: always try — live O/U overrides b365 (b365 esports O/U is often wrong)
-          try {
-            const vegasOdds = await getVegasOdds(entry.playerHome, entry.playerAway);
-            if (vegasOdds) {
-              // Prefer Vegas.hu O/U over b365 (live line is more accurate)
-              if (vegasOdds.ouLine > 0) {
-                realOuLine = vegasOdds.ouLine;
-                realOddsOver = vegasOdds.oddsOver;
-                realOddsUnder = vegasOdds.oddsUnder;
-                oddsSource = 'vegas.hu';
+          // ── O/U odds lekérés preferencia-alapú sorrendben (GT + eAdriatic) ──────
+          // Vegas 1x2: mindig próbáljuk (TC-fallback 1x2-höz)
+          let vegasResult: Awaited<ReturnType<typeof getVegasOdds>> | null = null;
+          try { vegasResult = await getVegasOdds(entry.playerHome, entry.playerAway); } catch { /* silent */ }
+          if (vegasResult) {
+            realOddsA = realOddsA ?? vegasResult.oddsA;
+            realOddsB = realOddsB ?? vegasResult.oddsB;
+          }
+
+          // VPS entry: beágyazott msport odds (Hetzner-en lekérve, Render-en is elérhető)
+          if ((entry as any).oddsSource === 'msport.com' && (entry as any).ouLine > 0) {
+            realOuLine    = realOuLine    ?? (entry as any).ouLine;
+            realOddsOver  = realOddsOver  ?? (entry as any).oddsOver;
+            realOddsUnder = realOddsUnder ?? (entry as any).oddsUnder;
+            if (oddsSource === 'estimated') oddsSource = 'msport.com';
+          }
+
+          // Preferált O/U odds sorrend: user választja (msport / cloudbet / vegas)
+          if (entry.league === 'GT Leagues' || entry.league === 'eAdriatic League') {
+            type OddsResult = { ouLine: number; oddsOver: number; oddsUnder: number; source: string } | null;
+
+            const fetchMsport = async (): Promise<OddsResult> => {
+              // Ha VPS már beágyazta az msport odds-ot, azt használjuk (Render-en nincs msport-hozzáférés)
+              if ((entry as any).oddsSource === 'msport.com' && (entry as any).ouLine > 0) {
+                return { ouLine: (entry as any).ouLine, oddsOver: (entry as any).oddsOver, oddsUnder: (entry as any).oddsUnder, source: 'msport.com' };
               }
-              // Use Vegas.hu 1X2 only if b365 hasn't provided them
-              realOddsA = realOddsA ?? vegasOdds.oddsA;
-              realOddsB = realOddsB ?? vegasOdds.oddsB;
-              if (oddsSource === 'estimated' && (vegasOdds.oddsA || vegasOdds.oddsB)) {
-                oddsSource = 'vegas.hu';
-              }
+              try {
+                const r = await getMsportOddsForMatch(entry.playerHome, entry.playerAway);
+                return r && r.ouLine > 0 ? { ...r, source: 'msport.com' } : null;
+              } catch { return null; }
+            };
+            const fetchCloudbet = async (): Promise<OddsResult> => {
+              try {
+                if (!getCloudbetKeyStatus().configured) return null;
+                const r = await getCloudbetOddsForMatch(entry.playerHome, entry.playerAway);
+                return r && r.ouLine > 0 ? { ...r, source: 'cloudbet' } : null;
+              } catch { return null; }
+            };
+            const fetchVegas = async (): Promise<OddsResult> => {
+              if (vegasResult && vegasResult.ouLine > 0)
+                return { ouLine: vegasResult.ouLine, oddsOver: vegasResult.oddsOver, oddsUnder: vegasResult.oddsUnder, source: 'vegas.hu' };
+              return null;
+            };
+
+            // Minden forrás párhuzamosan — allOdds (a frontend dönti el melyiket mutatja)
+            const [msportFetch, cloudbetFetch, vegasFetch] = await Promise.allSettled([
+              fetchMsport(), fetchCloudbet(), fetchVegas(),
+            ]);
+            const msportR  = msportFetch.status  === 'fulfilled' ? msportFetch.value  : null;
+            const cloudbetR = cloudbetFetch.status === 'fulfilled' ? cloudbetFetch.value : null;
+            const vegasR   = vegasFetch.status   === 'fulfilled' ? vegasFetch.value   : null;
+
+            // Összes elérhető forrás O/U adatai
+            const tipAllOdds: Record<string, { ouLine: number; oddsOver?: number; oddsUnder?: number }> = {};
+            if (msportR  && msportR.ouLine  > 0) tipAllOdds['msport.com'] = { ouLine: msportR.ouLine,  oddsOver: msportR.oddsOver  ?? undefined, oddsUnder: msportR.oddsUnder  ?? undefined };
+            if (cloudbetR && cloudbetR.ouLine > 0) tipAllOdds['cloudbet']  = { ouLine: cloudbetR.ouLine, oddsOver: cloudbetR.oddsOver ?? undefined, oddsUnder: cloudbetR.oddsUnder ?? undefined };
+            if (vegasR   && vegasR.ouLine   > 0) tipAllOdds['vegas.hu']  = { ouLine: vegasR.ouLine,   oddsOver: vegasR.oddsOver   ?? undefined, oddsUnder: vegasR.oddsUnder   ?? undefined };
+            (entry as any)._allOdds = tipAllOdds;
+
+            // Elsődleges forrás: preferált sorrend, majd fallback
+            const preferredR = preferOdds === 'cloudbet' ? cloudbetR : preferOdds === 'vegas' ? vegasR : msportR;
+            const primaryR = preferredR ?? msportR ?? cloudbetR ?? vegasR;
+            if (primaryR) {
+              realOuLine    = primaryR.ouLine;
+              realOddsOver  = primaryR.oddsOver  ?? undefined;
+              realOddsUnder = primaryR.oddsUnder ?? undefined;
+              oddsSource    = primaryR.source;
             }
-          } catch {
-            // ignore - fallback to estimated
+            (entry as any)._oddsDiff = (!preferredR && primaryR) ? 0.01 : undefined;
+          } else {
+            // Nem GT/ADR liga: Vegas O/U elsődleges (TC már lefutott fent)
+            if (vegasResult && vegasResult.ouLine > 0) {
+              realOuLine    = vegasResult.ouLine;
+              realOddsOver  = vegasResult.oddsOver;
+              realOddsUnder = vegasResult.oddsUnder;
+              oddsSource    = 'vegas.hu';
+            }
+          }
+
+          // GT + eAdriatic + H2H GG: csak valódi odds értelmes
+          // Kivétel: VPS-ről érkező bejegyzések 'estimated'-del is megjelennek
+          // (Render datacenter IP-ről odds nem scrape-elhető, de a menetrend hiteles)
+          if ((entry.league === 'GT Leagues' || entry.league === 'eAdriatic League' || entry.league === 'Esoccer H2H GG League')
+              && oddsSource !== 'vegas.hu' && oddsSource !== 'msport.com' && oddsSource !== 'cloudbet'
+              && oddsSource !== 'bet365'
+              && !(entry as any)._fromVps) {
+            oddsSource = 'n/a';
           }
 
           // Fallback: estimated odds
@@ -832,7 +2038,7 @@ app.get('/api/top-tips', async (req, res) => {
             h2hAvgGoalsA, h2hAvgGoalsB, h2hOverRates,
           });
 
-          // ========== KELLY STAKE CALCULATION (ÚJ!) ==========
+          // ========== KELLY STAKE CALCULATION ==========
           let stake = result.stakeFt;
           if (selectedStrategy.kellyEnabled) {
             const b = result.kivalasztottOdds - 1;
@@ -846,14 +2052,63 @@ app.get('/api/top-tips', async (req, res) => {
           }
           // ========== END KELLY ==========
 
+          // ========== STRATEGY C POST-PROCESSING ==========
+          let finalConfidence = result.confidence;
+          let finalValueBet = result.valueBet;
+
+          if (selectedStrategy.id === 'C') {
+            const today = todayMMDD();
+
+            // 1. Fáradsági szűrő: ha valamelyik játékos maxMatchesToday+ meccset játszott ma → kizárás
+            if (selectedStrategy.fatiguePenalty && selectedStrategy.maxMatchesToday !== undefined) {
+              const matchesTodayA = a.lastMatches.filter(m => m.date.startsWith(today)).length;
+              const matchesTodayB = b.lastMatches.filter(m => m.date.startsWith(today)).length;
+              if (matchesTodayA >= selectedStrategy.maxMatchesToday || matchesTodayB >= selectedStrategy.maxMatchesToday) {
+                finalValueBet = 'PASS'; // kizárás
+              } else if (matchesTodayA >= 2 || matchesTodayB >= 2) {
+                // 2+ meccs ma → konfidencia -7%
+                finalConfidence = finalConfidence * 0.93;
+              }
+            }
+
+            // 2. Forma-trend adjusztáció: form10 vs form50 alapján
+            if (selectedStrategy.formTrendBonus && finalValueBet !== 'PASS') {
+              // Melyik játékos a favorit (nagyobb winEsely)
+              const favoritIsA = result.winEselyA >= result.winEselyB;
+              const formTrendFav = favoritIsA ? (a.form10 - a.form50) : (b.form10 - b.form50);
+              const formTrendUnder = favoritIsA ? (b.form10 - b.form50) : (a.form10 - a.form50);
+              if (formTrendFav < -0.05) {
+                // Favorit hanyatlik → konfidencia -8%
+                finalConfidence = finalConfidence * 0.92;
+              } else if (formTrendFav > 0.05 && formTrendUnder <= 0) {
+                // Favorit javul, ellenfél stagnál/romlik → kis bónusz +3%
+                finalConfidence = Math.min(0.95, finalConfidence * 1.03);
+              }
+            }
+
+            // 3. Gól-vonal delta szűrő: várható gól nem elég messze a vonaltól → O/U PASS
+            if (selectedStrategy.goalLineDeltaMin !== undefined && finalValueBet !== 'PASS') {
+              const isOUBet = finalValueBet === 'OVER' || finalValueBet === 'UNDER';
+              if (isOUBet && Math.abs(result.vartOsszesGol - finalOuLine) < selectedStrategy.goalLineDeltaMin) {
+                finalValueBet = 'PASS'; // túl bizonytalan
+              }
+            }
+
+            // 4. H2H kötelező szűrő
+            if (selectedStrategy.requireH2H && h2hTotal < (selectedStrategy.minH2HMatches ?? 8)) {
+              finalValueBet = 'PASS';
+            }
+          }
+          // ========== END STRATEGY C ==========
+
           return {
             time: entry.time, date: entry.date, league: entry.league,
             playerA: entry.playerHome, teamA: entry.teamHome,
             playerB: entry.playerAway, teamB: entry.teamAway,
-            valueBet: result.valueBet,
-            confidence: result.confidence,
+            valueBet: finalValueBet,
+            confidence: finalConfidence,
             edge: result.kivalasztottEdge,
-            stake: stake,  // ← VÁLTOZOTT! (result.stakeFt helyett)
+            stake: stake,
             winEselyA: result.winEselyA,
             winEselyB: result.winEselyB,
             overEsely: result.overEsely,
@@ -867,35 +2122,61 @@ app.get('/api/top-tips', async (req, res) => {
             h2hSource,
             tcMatchId: tcMatchId || undefined,
             oddsSource,
+            oddsDiff: (entry as any)._oddsDiff as number | undefined,
             oddsA: finalOddsA,
             oddsB: finalOddsB,
             oddsOver: finalOddsOver,
             oddsUnder: finalOddsUnder,
-            category: classifyBet(result.confidence, result.kivalasztottEdge, result.valueBet),
+            category: classifyBetWithStrategy(finalConfidence, result.kivalasztottEdge, finalValueBet, selectedStrategy),
             warning: sanityWarning(result.kivalasztottEdge, h2hTotal, oddsSource),
             h2hOverRates: h2hOverRates || undefined,
             h2hEffectiveSize,
             movement1x2, movementGoals,
             strategy: selectedStrategy.id,
-            lastMatchesA: a.lastMatches.slice(0, 10).map(m => ({
-              opponent: m.opponent, scoreHome: m.scoreHome,
-              scoreAway: m.scoreAway, result: m.result, date: m.date,
-            })),
-            lastMatchesB: b.lastMatches.slice(0, 10).map(m => ({
-              opponent: m.opponent, scoreHome: m.scoreHome,
-              scoreAway: m.scoreAway, result: m.result, date: m.date,
-            })),
+            lastMatchesA: await (async () => {
+              // Supabase alapú egyéni form-adatok — 10 perces cache (egress csökkentés)
+              const sbA = await cached(
+                `sbplayer:${entry.playerHome}:${entry.league}`,
+                () => getPlayerMatchesFromSupabase(entry.playerHome, entry.league, 10),
+                10 * 60_000,
+              );
+              const base = sbA.length >= 5 ? sbA : a.lastMatches.slice(0, 10).map(m => ({
+                opponent: m.opponent, opponentTeam: m.opponentTeam ?? '', team: m.team ?? '',
+                scoreHome: m.scoreHome, scoreAway: m.scoreAway, result: m.result, date: m.date,
+              }));
+              return base.map(m => ({ opponent: m.opponent, scoreHome: m.scoreHome, scoreAway: m.scoreAway, result: m.result, date: m.date }));
+            })(),
+            lastMatchesB: await (async () => {
+              const sbB = await cached(
+                `sbplayer:${entry.playerAway}:${entry.league}`,
+                () => getPlayerMatchesFromSupabase(entry.playerAway, entry.league, 10),
+                10 * 60_000,
+              );
+              const base = sbB.length >= 5 ? sbB : b.lastMatches.slice(0, 10).map(m => ({
+                opponent: m.opponent, opponentTeam: m.opponentTeam ?? '', team: m.team ?? '',
+                scoreHome: m.scoreHome, scoreAway: m.scoreAway, result: m.result, date: m.date,
+              }));
+              return base.map(m => ({ opponent: m.opponent, scoreHome: m.scoreHome, scoreAway: m.scoreAway, result: m.result, date: m.date }));
+            })(),
             gfPerMatchA: a.gfPerMatch,
             gaPerMatchA: a.gaPerMatch,
             gfPerMatchB: b.gfPerMatch,
             gaPerMatchB: b.gaPerMatch,
             h2hMatchHistory: h2hMatchHistory.length > 0 ? h2hMatchHistory : undefined,
+            allOdds: Object.keys((entry as any)._allOdds ?? {}).length > 0
+              ? (entry as any)._allOdds as Record<string, { ouLine: number; oddsOver?: number; oddsUnder?: number }>
+              : undefined,
           };
         })
       );
 
       for (const r of results) {
-        if (r.status === 'fulfilled') allResults.push(r.value);
+        if (r.status === 'fulfilled') {
+          allResults.push(r.value);
+        } else {
+          // Hiba logolása — mindig, minden elutasított entry-nél
+          console.error(`[top-tips] ❌ Batch entry hiba: ${r.reason instanceof Error ? r.reason.stack ?? r.reason.message : String(r.reason)}`);
+        }
       }
     }
 
@@ -909,14 +2190,26 @@ app.get('/api/top-tips', async (req, res) => {
       return true;
     });
 
-    // 4. Filter & rank (categories: STRONG_BET > BET, H2H boost, real odds boost)
+    // 4. Filter & rank
+    // GT Leagues + eAdriatic: MINDEN meccs megjelenik (nincs NO_BET szűrő), csak n/a kizárva.
+    //   → 1 órás előzetes nézet: az összes közelgő meccs látható odds-elemzéssel.
+    // Többi liga: csak BET / STRONG_BET, konfidencia + edge szűrővel.
+    const isMsportOnlyFilter = leagueFilter === 'GT Leagues' || leagueFilter === 'eAdriatic League';
+    const msportLimit = 60; // 1 óra ~ 5 GT + 6 eAdriatic = 11 meccs; 60 biztonságos felső korlát
+
     const valueBets = deduplicated
-      .filter(r => r.category !== 'NO_BET' && r.confidence >= minConf && r.edge >= minEdge)
+      .filter(r => isMsportOnlyFilter
+        ? r.oddsSource !== 'n/a'   // GT + eAdriatic: minden meccs valódi odds-szal
+        : r.category !== 'NO_BET' && r.confidence >= minConf && r.edge >= minEdge && r.oddsSource !== 'n/a'
+      )
       .sort((a, b) => {
-        // Category score: STRONG_BET = 2, BET = 1
+        // GT + eAdriatic: idő szerint rendezve (következő meccs elöl)
+        if (isMsportOnlyFilter) {
+          return a.time.localeCompare(b.time);
+        }
+        // Többi liga: Category score: STRONG_BET = 2, BET = 1
         const catScore = (t: typeof a) => (t.category === 'STRONG_BET' ? 2 : 1);
         if (catScore(b) !== catScore(a)) return catScore(b) - catScore(a);
-
         // Within same category: H2H + real odds + weighted conf/edge
         const h2hBoost = (t: typeof a) => (t.h2hMode ? 0.10 : 0);
         const oddsBoost = (t: typeof a) => (t.oddsSource === 'bet365' ? 0.05 : 0);
@@ -924,9 +2217,17 @@ app.get('/api/top-tips', async (req, res) => {
         const scoreB = b.confidence * 0.6 + b.edge * 4 + h2hBoost(b) + oddsBoost(b);
         return scoreB - scoreA;
       })
-      .slice(0, limit);
+      .slice(0, isMsportOnlyFilter ? msportLimit : limit);
 
-    res.json({
+    // Debug: hány tipp megy át az egyes filtereken
+    console.log(`[top-tips] league=${leagueFilter ?? 'ALL'} | schedule=${schedule.length} analyzed=${allResults.length} deduped=${deduplicated.length} passing=${valueBets.length} (isMsportOnly=${isMsportOnlyFilter})`);
+    if (valueBets.length === 0 && deduplicated.length > 0) {
+      // Miért szűrte ki mindet? — első 3 entry oddsSource + category megjelenítése
+      const sample = deduplicated.slice(0, 3).map(r => `${r.playerA}|${r.playerB}: oddsSource=${r.oddsSource} category=${r.category} conf=${r.confidence.toFixed(2)}`);
+      console.log(`[top-tips] ⚠️ 0 tipp — minta: ${sample.join(' || ')}`);
+    }
+
+    const responsePayload = {
       generated: new Date().toISOString(),
       totalScanned: schedule.length,
       totalAnalyzed: allResults.length,
@@ -938,8 +2239,16 @@ app.get('/api/top-tips', async (req, res) => {
         settings: selectedStrategy.settings,
         kellyEnabled: selectedStrategy.kellyEnabled,
       },
-    });
+    };
+    // Cache-elés + in-flight lezárás
+    _topTipsCache.set(cacheKey, { data: responsePayload, ts: Date.now() });
+    _topTipsInFlight.delete(cacheKey);
+    _resolveInFlight?.(responsePayload);
+    res.json(responsePayload);
   } catch (e: unknown) {
+    _topTipsInFlight.delete(cacheKey);
+    // Várakozó in-flight requestek ne lógjanak örökre — adjunk vissza üres eredményt
+    _resolveInFlight?.({ generated: new Date().toISOString(), totalScanned: 0, totalAnalyzed: 0, totalValueBets: 0, tips: [], strategy: { id: selectedStrategy.id, name: selectedStrategy.name, settings: selectedStrategy.settings, kellyEnabled: selectedStrategy.kellyEnabled } });
     res.status(500).json({ error: e instanceof Error ? e.message : 'Unknown error' });
   }
 });
@@ -1166,7 +2475,7 @@ app.get('/api/backtest/:player', async (req, res) => {
     const league = (req.query.league as string) || 'GT Leagues';
     const opponent = req.query.opponent as string | undefined;
     const liga = league === 'GT Leagues' ? 'GT Leagues' as const
-      : league === 'Cyber Live Arena' ? 'eAdriaticLeague' as const
+      : league === 'eAdriatic League' ? 'eAdriaticLeague' as const
         : 'Other' as const;
 
     const matches = await buildBacktestData(req.params.player, league, opponent);
@@ -1182,7 +2491,7 @@ app.post('/api/optimize/:player', async (req, res) => {
   try {
     const league = (req.query.league as string) || 'GT Leagues';
     const liga = league === 'GT Leagues' ? 'GT Leagues' as const
-      : league === 'Cyber Live Arena' ? 'eAdriaticLeague' as const
+      : league === 'eAdriatic League' ? 'eAdriaticLeague' as const
         : 'Other' as const;
 
     const matches = await buildBacktestData(req.params.player, league);
@@ -1286,12 +2595,85 @@ app.post('/api/scanner/run', async (_req, res) => {
   res.json({ ran: result !== null, tipsFound: result?.tips.length || 0 });
 });
 
+// GET /api/trend/status
+app.get('/api/trend/status', (_req, res) => {
+  res.json(getTrendScannerState());
+});
+
+// POST /api/trend/run - manually trigger a trend scan
+app.post('/api/trend/run', async (_req, res) => {
+  try {
+    const { signals, pushed } = await runTrendScanOnce();
+    res.json({ ran: true, signalsFound: signals.length, pushed, signals });
+  } catch (e: unknown) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Unknown error' });
+  }
+});
+
 // Configure scanner to call our own /api/top-tips endpoint
 const SELF_URL = `http://localhost:${process.env.PORT || '3005'}`;
 configureScanner(async () => {
   const r = await fetch(`${SELF_URL}/api/top-tips?limit=20&minConf=0.65&minEdge=0.04`);
   if (!r.ok) throw new Error(`Top-tips fetch failed: ${r.status}`);
   return r.json() as Promise<ReturnType<typeof getCachedResult> & object>;
+});
+
+// Configure intraday H2H trend scanner
+configureTrendScanner({
+  getSchedule: getCombinedSchedule,
+  getPlayerStats: async (name, league) => {
+    return cached(`player:${name}:${league}`, () => getPlayerStats(name, league));
+  },
+  getAllOdds: async (playerA, playerB) => {
+    const result: Record<string, { ouLine: number; oddsOver?: number }> = {};
+
+    // 1. msport: a VPS már lekérte és beágyazta a schedule entry-kbe (ouLine, oddsOver, oddsSource='msport.com')
+    //    Ezt olvassuk ki a cache-elt schedule-ból — nincs közvetlen msport hívás (production-on timeout)
+    try {
+      const sched = await cached('schedule', getCombinedSchedule, SCHEDULE_CACHE_TTL);
+      const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const nA = norm(playerA), nB = norm(playerB);
+      const entry = (sched as any[]).find(m => {
+        const eA = norm(m.playerHome ?? ''), eB = norm(m.playerAway ?? '');
+        return (
+          (eA.includes(nA) || nA.includes(eA)) && (eB.includes(nB) || nB.includes(eB))
+        ) || (
+          (eA.includes(nB) || nB.includes(eA)) && (eB.includes(nA) || nA.includes(eB))
+        );
+      });
+      if (entry && (entry.ouLine ?? 0) > 0) {
+        result['msport.com'] = { ouLine: entry.ouLine, oddsOver: entry.oddsOver };
+      }
+    } catch { /* skip */ }
+
+    // 2. Cloudbet — VPS cache (GT + ADR, nem blokkolt IP), majd Trading API fallback
+    try {
+      const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const nA = norm(playerA), nB = norm(playerB);
+      const vpsEntry = _vpsCbOdds.find(o => {
+        const eA = norm(o.playerA), eB = norm(o.playerB);
+        return (eA.includes(nA) || nA.includes(eA)) && (eB.includes(nB) || nB.includes(eB))
+            || (eA.includes(nB) || nB.includes(eA)) && (eB.includes(nA) || nA.includes(eB));
+      });
+      if (vpsEntry && vpsEntry.ouLine > 0) {
+        result['cloudbet'] = { ouLine: vpsEntry.ouLine, oddsOver: vpsEntry.oddsOver };
+      } else {
+        // Fallback: Cloudbet Trading API (eAdriatic)
+        const cb = getCloudbetKeyStatus().configured
+          ? await getCloudbetOddsForMatch(playerA, playerB)
+          : null;
+        if (cb && cb.ouLine > 0) result['cloudbet'] = { ouLine: cb.ouLine, oddsOver: cb.oddsOver };
+      }
+    } catch { /* skip */ }
+
+    // 3. Vegas.hu (Altenar)
+    try {
+      const v = await getVegasOdds(playerA, playerB);
+      if (v && v.ouLine > 0) result['vegas.hu'] = { ouLine: v.ouLine, oddsOver: v.oddsOver };
+    } catch { /* skip */ }
+
+    return result;
+  },
 });
 
 // Telegram bot command handler
@@ -1305,9 +2687,10 @@ async function handleBotCommand(cmd: string, args: string): Promise<string> {
         '/top — Napi top 5 tipp',
         '/strong — Csak STRONG BET tippek',
         '/scan — Friss scan futtatása',
+        '/trend — Intraday H2H trend jelzések',
         '/status — Scanner állapot',
         '',
-        '_Új STRONG BET tippeket automatikusan push-olok 15 percenként._',
+        '_STRONG BET: 15 percenként · Trend jelzés: 5 percenként_',
       ].join('\n');
 
     case 'top': {
@@ -1334,16 +2717,34 @@ async function handleBotCommand(cmd: string, args: string): Promise<string> {
       return `✅ Scan kész\n\n${r.totalScanned} meccs scannelve\n${r.tips.length} tipp\n${strongCount} STRONG BET`;
     }
 
+    case 'trend': {
+      await sendMessage('🔄 Trend scan elindult...');
+      try {
+        const { signals, pushed } = await runTrendScanOnce();
+        if (signals.length === 0) return '📊 Nincs aktív trend jelzés most.';
+        return `📈 ${signals.length} trend jelzés találva, ${pushed} Telegram értesítés küldve.`;
+      } catch {
+        return '❌ Trend scan sikertelen';
+      }
+    }
+
     case 'status': {
       const s = getScannerState();
+      const ts = getTrendScannerState();
       return [
         '*Scanner állapot*',
         '',
         `Fut: ${s.isRunning ? '🟢 Igen' : '🔴 Nem'}`,
-        `Utolsó scan: ${s.lastRunISO || 'soha'}`,
+        `Utolsó top-tips scan: ${s.lastRunISO || 'soha'}`,
         `Cache-elt tippek: ${s.cachedTipCount}`,
         `Push-olt tippek: ${s.pushedCount}`,
-        `Hibák: ${s.errors}`,
+        '',
+        '*Trend Scanner*',
+        `Fut: ${ts.isRunning ? '🟢 Igen' : '🔴 Nem'}`,
+        `Utolsó trend scan: ${ts.lastRunISO || 'soha'}`,
+        `Utolsó jelzések: ${ts.lastSignalCount}`,
+        `Push-olt jelzések: ${ts.pushedCount}`,
+        `Hibák: ${ts.errors}`,
       ].join('\n');
     }
 
@@ -1530,18 +2931,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.join(__dirname, '..', 'dist');
 
 app.use(express.static(distPath));
-// SPA fallback - only for non-API routes
-//app.get('*', (req, res) => {
-  // Skip API routes - let them 404 naturally
-  //if (req.path.startsWith('/api')) {
-  //  res.status(404).json({ error: 'API endpoint not found' });
-  //  return;
-  //}
-  // SPA fallback for non-API routes
-  //res.sendFile(path.join(distPath, 'index.html'));
-//});
 
-// ============ TOTALCORNER ENDPOINTS ============  
+// ============ TOTALCORNER ENDPOINTS ============
 
 app.get('/api/tc/players/:league', async (req, res) => {
   try {
@@ -1610,8 +3001,896 @@ app.get('/api/tc/schedule/:league', async (req, res) => {
     res.status(500).json({ error: e instanceof Error ? e.message : 'Unknown error' });
   }
 });
-// ============ VÉGÜK ============  
+// ============ RESULT RESOLVER — esoccerbet.org ============
+const MATCH_DURATION_MIN: Record<string, number> = {
+  'GT Leagues': 12,
+  'eAdriatic League': 10,
+  'Esoccer Battle': 8,
+  'Esports Volta': 6,
+  'Esoccer H2H GG League': 8,
+};
 
-app.listen(3005, '0.0.0.0', () => {  
-  console.log('--- FIGYELEM: EZ A 3005-OS VERZIO ---');
+function fuzzyNameMatch(a: string, b: string): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const nA = norm(a);
+  const nB = norm(b);
+  if (nA === nB) return true;
+  const short = nA.length < nB.length ? nA : nB;
+  const long  = nA.length < nB.length ? nB : nA;
+  return long.includes(short.slice(0, Math.min(6, short.length)));
+}
+
+function parseDateToMs(dateStr: string, refTimestamp: number): number | null {
+  // Formats seen: "04/26 14:30", "14:30", "04/26"
+  const parts = dateStr.trim().split(/\s+/);
+  const ref = new Date(refTimestamp);
+  const year = ref.getFullYear();
+
+  if (parts.length === 2) {
+    // "MM/DD HH:MM"
+    const [md, hm] = parts;
+    const [mo, dy] = md.split('/').map(Number);
+    const [hh, mm] = hm.split(':').map(Number);
+    return new Date(year, mo - 1, dy, hh, mm).getTime();
+  }
+  if (parts.length === 1) {
+    if (parts[0].includes('/')) {
+      // "MM/DD"
+      const [mo, dy] = parts[0].split('/').map(Number);
+      return new Date(year, mo - 1, dy, ref.getHours(), ref.getMinutes()).getTime();
+    }
+    if (parts[0].includes(':')) {
+      // "HH:MM" — assume same day
+      const [hh, mm] = parts[0].split(':').map(Number);
+      return new Date(year, ref.getMonth(), ref.getDate(), hh, mm).getTime();
+    }
+  }
+  return null;
+}
+
+app.post('/api/resolve-results', async (req, res) => {
+  try {
+    const { matches } = req.body as {
+      matches: {
+        matchId: string;
+        playerA: string;
+        playerB: string;
+        league: string;
+        timestamp: number;
+        betType: string;
+        betLine: number;
+      }[];
+    };
+
+    const results = await Promise.all(matches.map(async (m) => {
+      try {
+        const duration = MATCH_DURATION_MIN[m.league] ?? 10;
+        const matchEndMs = m.timestamp + (duration + 3) * 60 * 1000;
+        if (Date.now() < matchEndMs + 5000) {
+          return { matchId: m.matchId, pending: true };
+        }
+
+        // Fresh scrape — no cache so we always get the latest results
+        const playerResults = await scrapePlayerResults(m.playerA, m.league);
+
+        // Find the specific match: fuzzy opponent name + date proximity (±30 min)
+        const found = playerResults.find(r => {
+          if (!fuzzyNameMatch(r.opponent, m.playerB)) return false;
+          const rMs = parseDateToMs(r.date, m.timestamp);
+          if (rMs === null) return true; // no date info → accept name match
+          return Math.abs(rMs - m.timestamp) < 30 * 60 * 1000;
+        });
+
+        if (!found) {
+          // Fallback: try scraping from playerB's perspective
+          const playerBResults = await scrapePlayerResults(m.playerB, m.league);
+          const foundB = playerBResults.find(r => {
+            if (!fuzzyNameMatch(r.opponent, m.playerA)) return false;
+            const rMs = parseDateToMs(r.date, m.timestamp);
+            if (rMs === null) return true;
+            return Math.abs(rMs - m.timestamp) < 30 * 60 * 1000;
+          });
+          if (!foundB) return { matchId: m.matchId, pending: true };
+
+          // From playerB's perspective: scoreHome=B, scoreAway=A → swap
+          const total = foundB.scoreHome + foundB.scoreAway;
+          const scoreA = foundB.scoreAway;
+          const scoreB = foundB.scoreHome;
+          let outcome: 'Win' | 'Loss' | null = null;
+          if (m.betType === 'Over')  outcome = total > m.betLine ? 'Win' : 'Loss';
+          if (m.betType === 'Under') outcome = total < m.betLine ? 'Win' : 'Loss';
+          return { matchId: m.matchId, score: `${scoreA}:${scoreB}`, total, outcome, pending: false };
+        }
+
+        const total = found.scoreHome + found.scoreAway;
+        let outcome: 'Win' | 'Loss' | null = null;
+        if (m.betType === 'Over')  outcome = total > m.betLine ? 'Win' : 'Loss';
+        if (m.betType === 'Under') outcome = total < m.betLine ? 'Win' : 'Loss';
+        return { matchId: m.matchId, score: `${found.scoreHome}:${found.scoreAway}`, total, outcome, pending: false };
+      } catch {
+        return { matchId: m.matchId, pending: true };
+      }
+    }));
+
+    res.json(results);
+  } catch (e: unknown) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'Unknown error' });
+  }
+});
+
+// ============ JOURNAL PERSISTENCE ============
+
+async function getUserId(req: express.Request): Promise<string | null> {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token || !supabase) return null;
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return null;
+    return user.id;
+  } catch { return null; }
+}
+
+app.get('/api/journal', async (req, res) => {
+  try {
+    const userId = await getUserId(req);
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    res.json(await loadJournal(userId));
+  } catch { res.json([]); }
+});
+
+app.post('/api/journal', async (req, res) => {
+  try {
+    const userId = await getUserId(req);
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    await saveJournalDb(userId, req.body);
+    res.json({ ok: true });
+  } catch { res.status(500).json({ ok: false }); }
+});
+
+app.get('/api/settings', async (req, res) => {
+  try {
+    const userId = await getUserId(req);
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    const data = await loadSettingsDb(userId);
+    res.json(data ?? {});
+  } catch { res.json({}); }
+});
+
+app.post('/api/settings', async (req, res) => {
+  try {
+    const userId = await getUserId(req);
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    await saveSettingsDb(userId, req.body);
+    res.json({ ok: true });
+  } catch { res.status(500).json({ ok: false }); }
+});
+
+// ── Checked matches endpoints ────────────────────────────────────────────────
+
+app.get('/api/checked-matches', async (req, res) => {
+  try {
+    const userId = await getUserId(req);
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    res.json(await loadCheckedMatches(userId));
+  } catch { res.json([]); }
+});
+
+app.post('/api/checked-matches', async (req, res) => {
+  try {
+    const userId = await getUserId(req);
+    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    await saveCheckedMatchesDb(userId, req.body);
+    res.json({ ok: true });
+  } catch { res.status(500).json({ ok: false }); }
+});
+
+// ── Subscription endpoints ────────────────────────────────────────────────────
+
+app.get('/api/subscription', async (req, res) => {
+  const userId = await getUserId(req);
+  if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+  const sub = await getSubscription(userId);
+  // Auto-create 30-day trial on first login
+  if (!sub) {
+    await upsertSubscription(userId, 30);
+    const created = await getSubscription(userId);
+    res.json(created ?? { plan: 'pro', expires_at: new Date(Date.now() + 30 * 86400_000).toISOString() });
+    return;
+  }
+  res.json(sub);
+});
+
+// ── Admin endpoints ───────────────────────────────────────────────────────────
+
+function isAdminEmail(email: string): boolean {
+  const list = (process.env.ADMIN_EMAILS ?? '').split(',').map(e => e.trim().toLowerCase());
+  return list.includes(email.toLowerCase());
+}
+
+async function requireAdmin(req: express.Request, res: express.Response): Promise<string | null> {
+  const sb = supabase;
+  if (!sb) { res.status(503).json({ error: 'Supabase not configured' }); return null; }
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) { res.status(401).json({ error: 'Unauthorized' }); return null; }
+  const { data: { user }, error } = await sb.auth.getUser(token);
+  if (error || !user?.email || !isAdminEmail(user.email)) {
+    res.status(403).json({ error: 'Forbidden' }); return null;
+  }
+  return user.id;
+}
+
+app.get('/api/admin/status', async (req, res) => {
+  const sb = supabase;
+  if (!sb) { res.json({ isAdmin: false }); return; }
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) { res.json({ isAdmin: false }); return; }
+  const { data: { user } } = await sb.auth.getUser(token);
+  res.json({ isAdmin: !!user?.email && isAdminEmail(user.email) });
+});
+
+app.get('/api/admin/users', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  const sb = supabase!;
+  try {
+    const { data: { users }, error } = await sb.auth.admin.listUsers({ perPage: 1000 });
+    if (error) throw error;
+    const { data: subs } = await sb.from('subscriptions').select('user_id,plan,expires_at');
+    const subMap = new Map((subs ?? []).map((s: any) => [s.user_id, s]));
+    const result = users.map(u => ({
+      id: u.id,
+      email: u.email,
+      created_at: u.created_at,
+      email_confirmed: !!u.email_confirmed_at,
+      subscription: subMap.get(u.id) ?? null,
+    }));
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e?.message }); }
+});
+
+app.post('/api/admin/users/:userId/extend', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  const { days = 30 } = req.body;
+  await upsertSubscription(req.params.userId, Number(days));
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/users/:userId/revoke', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  await revokeSubscription(req.params.userId);
+  res.json({ ok: true });
+});
+
+// GET /api/admin/supabase/stats — összes tábla sorszáma + összesített méret
+app.get('/api/admin/supabase/stats', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  const sb = supabase;
+  if (!sb) { res.status(503).json({ error: 'Supabase nincs konfigurálva' }); return; }
+
+  const tables = ['app_data', 'completed_matches', 'journals', 'user_settings', 'subscriptions', 'user_checked_matches'];
+  const stats: Array<{ table: string; count: number | null; error?: string }> = [];
+  for (const t of tables) {
+    try {
+      const { count, error } = await sb.from(t).select('*', { count: 'exact', head: true });
+      if (error) stats.push({ table: t, count: null, error: error.message });
+      else stats.push({ table: t, count: count ?? 0 });
+    } catch (e: any) {
+      stats.push({ table: t, count: null, error: e?.message ?? 'unknown' });
+    }
+  }
+  res.json({ tables: stats, generated: new Date().toISOString() });
+});
+
+app.get('/api/admin/logs', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  const limit = Math.min(parseInt(req.query.limit as string) || 200, MAX_LOG_ENTRIES);
+  res.json({ logs: _logBuffer.slice(-limit), total: _logBuffer.length });
+});
+
+app.delete('/api/admin/logs', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  _logBuffer.length = 0;
+  res.json({ ok: true });
+});
+
+// GET /api/admin/supabase/peek/:table?limit=20&offset=0 — táblába belenézés lapozással
+app.get('/api/admin/supabase/peek/:table', async (req, res) => {
+  const adminId = await requireAdmin(req, res);
+  if (!adminId) return;
+  const sb = supabase;
+  if (!sb) { res.status(503).json({ error: 'Supabase nincs konfigurálva' }); return; }
+
+  const allowed = new Set(['app_data', 'completed_matches', 'journals', 'user_settings', 'subscriptions', 'user_checked_matches']);
+  const table = req.params.table;
+  if (!allowed.has(table)) { res.status(400).json({ error: 'Ismeretlen tábla' }); return; }
+  const limit = Math.min(parseInt(req.query.limit as string) || 20, 200);
+  const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+
+  try {
+    // Supabase Postgrest range = inclusive: [from, to]
+    let q = sb.from(table).select('*', { count: 'exact' }).range(offset, offset + limit - 1);
+    if (table === 'completed_matches') q = q.order('start_time', { ascending: false });
+    if (table === 'subscriptions' || table === 'journals' || table === 'user_settings') q = q.order('updated_at', { ascending: false, nullsFirst: false });
+    const { data, error, count } = await q;
+    if (error) { res.status(500).json({ error: error.message }); return; }
+    res.json({ table, rows: data ?? [], limit, offset, total: count ?? null });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message ?? 'unknown' });
+  }
+});
+
+// GET /api/match-result?playerA=&playerB=&league=&startTime=
+// Lejátszott meccs végeredményét adja vissza.
+// Forrás prioritás: 1. _injectedCompleted (in-memory), 2. Supabase, 3. Cloudbet web live/finished
+app.get('/api/match-result', async (req, res) => {
+  try {
+    const pA = ((req.query.playerA as string) || '').toLowerCase().trim();
+    const pB = ((req.query.playerB as string) || '').toLowerCase().trim();
+    const league = (req.query.league as string) || '';
+    const startTime = parseInt(req.query.startTime as string) || 0; // ms
+    if (!pA || !pB) return res.json({ found: false });
+
+    const TOLERANCE_MS = 8 * 60 * 1000; // ±8 perc tűrés
+
+    // 1. _injectedCompleted in-memory
+    const inMem = (await getMsportMatchResults()).find(m =>
+      ((m.playerA === pA && m.playerB === pB) || (m.playerA === pB && m.playerB === pA)) &&
+      (!league || m.league === league) &&
+      (!startTime || Math.abs(m.startTime - startTime) < TOLERANCE_MS)
+    );
+    if (inMem) {
+      const fwd = inMem.playerA === pA;
+      return res.json({ found: true, scoreA: fwd ? inMem.scoreA : inMem.scoreB, scoreB: fwd ? inMem.scoreB : inMem.scoreA });
+    }
+
+    // 2. Supabase completed_matches
+    if (supabase) {
+      try {
+        const from = startTime ? startTime - TOLERANCE_MS : Date.now() - 24 * 3600_000;
+        const to   = startTime ? startTime + TOLERANCE_MS : Date.now();
+        const { data } = await supabase
+          .from('completed_matches')
+          .select('player_a,player_b,score_a,score_b')
+          .in('league', league ? [league] : ['GT Leagues', 'eAdriatic League'])
+          .gte('start_time', from).lte('start_time', to)
+          .limit(20);
+        const row = data?.find(r =>
+          (r.player_a === pA && r.player_b === pB) ||
+          (r.player_a === pB && r.player_b === pA)
+        );
+        if (row) {
+          const fwd = row.player_a === pA;
+          return res.json({ found: true, scoreA: fwd ? row.score_a : row.score_b, scoreB: fwd ? row.score_b : row.score_a });
+        }
+      } catch { /* silent */ }
+    }
+
+    // 3. Cloudbet web — élő + befejezett meccsek közvetlen lekérése
+    try {
+      const events = await getCloudbetWebAllEvents();
+      const ev = events.find(e => {
+        const eA = (e.homeTeam || '').toLowerCase();
+        const eB = (e.awayTeam || '').toLowerCase();
+        const isMatch = (eA.includes(pA) || pA.includes(eA)) && (eB.includes(pB) || pB.includes(eB)) ||
+                        (eA.includes(pB) || pB.includes(eA)) && (eB.includes(pA) || pA.includes(eB));
+        const isFinished = e.eventStatus === 'finished' || e.status === 'RESULTED' ||
+                           e.eventStatus === 'in_progress' || e.status === 'TRADING_LIVE';
+        return isMatch && isFinished && e.homeScore != null && e.awayScore != null;
+      });
+      if (ev && ev.homeScore != null && ev.awayScore != null) {
+        const eA = (ev.homeTeam || '').toLowerCase();
+        const fwd = eA.includes(pA) || pA.includes(eA);
+        return res.json({
+          found: true,
+          scoreA: fwd ? ev.homeScore : ev.awayScore,
+          scoreB: fwd ? ev.awayScore : ev.homeScore,
+          live: ev.eventStatus === 'in_progress' || ev.status === 'TRADING_LIVE',
+        });
+      }
+    } catch { /* silent */ }
+
+    return res.json({ found: false });
+  } catch (e: any) {
+    res.status(500).json({ found: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /api/h2h-quick/:playerA/:playerB?league=...
+// Könnyű H2H endpoint a Napi Mérkőzések kártyákhoz.
+// GT Leagues + eAdriatic League: msport.com forrás (esb fallback ha üres).
+// Visszaadja az utolsó 10 egymás elleni meccset + gólátlagot.
+app.get('/api/h2h-quick/:playerA/:playerB', async (req, res) => {
+  try {
+    const league = (req.query.league as string) || 'GT Leagues';
+    const pA = req.params.playerA;
+    const pB = req.params.playerB;
+
+    // GT + eAdriatic → in-memory _injectedCompleted + Supabase fallback
+    if (league === 'GT Leagues' || league === 'eAdriatic League') {
+      try {
+        const msport = await getMsportH2H(pA, pB, league);
+
+        // Ha van Supabase és kevés adat jött (pl. ma lejátszott meccs még nem injektálva),
+        // kiegészítjük a Supabase completed_matches-ból (azonnali eredmény)
+        if (supabase) {
+          try {
+            const sbH2H = await cached(
+              `sbh2h:${pA}:${pB}:${league}`,
+              () => getH2HFromSupabase(pA, pB, league, 15),
+              10 * 60_000,
+            );
+            if (sbH2H.length > 0) {
+              // Merge: msport + Supabase, dedup startTime alapján
+              const seen = new Set(msport.matches.map(m => m.date));
+              const now = new Date();
+              const todayPrefix = `${String(now.getMonth()+1).padStart(2,'0')}/${String(now.getDate()).padStart(2,'0')}`;
+              for (const sb of sbH2H) {
+                // Supabase date: "MM/DD HH:MM" formátum
+                const d = new Date(sb.startTime + 2 * 3600_000); // Budapest CEST
+                const sbDate = `${String(d.getUTCMonth()+1).padStart(2,'0')}/${String(d.getUTCDate()).padStart(2,'0')} ${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}`;
+                if (!seen.has(sbDate)) {
+                  seen.add(sbDate);
+                  const resultA: 'win'|'loss'|'draw' = sb.goalsA > sb.goalsB ? 'win' : sb.goalsA < sb.goalsB ? 'loss' : 'draw';
+                  msport.matches.push({ date: sbDate, scoreA: sb.goalsA, scoreB: sb.goalsB, totalGoals: sb.goalsA + sb.goalsB, resultA });
+                }
+              }
+              // Újra rendezés + limit
+              msport.matches.sort((a, b) => b.date.localeCompare(a.date));
+              if (msport.matches.length > 10) msport.matches.length = 10;
+              // todayCount újraszámolás
+              (msport as any).todayCount = msport.matches.filter(m => m.date.startsWith(todayPrefix)).length;
+              if (msport.matches.length > 0) {
+                (msport as any).avgGoals = msport.matches.reduce((s, m) => s + m.totalGoals, 0) / msport.matches.length;
+              }
+            }
+          } catch { /* silent */ }
+        }
+
+        return res.json(msport);
+      } catch {
+        return res.json({ matches: [], avgGoals: null, todayCount: 0 });
+      }
+    }
+
+    // Más ligák → esoccerbet.org
+    const [a, b] = await Promise.all([
+      cached(`player:${pA}:${league}`, () => scrapePlayerStats(pA, league)),
+      cached(`player:${pB}:${league}`, () => scrapePlayerStats(pB, league)),
+    ]);
+
+    const fromA = a.lastMatches
+      .filter(m => m.opponent.toLowerCase() === pB.toLowerCase())
+      .map(m => ({ date: m.date, scoreA: m.scoreHome, scoreB: m.scoreAway,
+        totalGoals: m.scoreHome + m.scoreAway, resultA: m.result as 'win'|'loss'|'draw' }));
+
+    const fromB = b.lastMatches
+      .filter(m => m.opponent.toLowerCase() === pA.toLowerCase())
+      .map(m => ({ date: m.date, scoreA: m.scoreAway, scoreB: m.scoreHome,
+        totalGoals: m.scoreHome + m.scoreAway,
+        resultA: (m.result === 'win' ? 'loss' : m.result === 'loss' ? 'win' : 'draw') as 'win'|'loss'|'draw' }));
+
+    const seen = new Set<string>();
+    const all = [...fromA, ...fromB].filter(m => {
+      const key = `${m.date}|${m.scoreA}:${m.scoreB}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    all.sort((x, y) => (y.date > x.date ? 1 : -1));
+    const matches = all.slice(0, 10);
+    const avgGoals = matches.length > 0
+      ? matches.reduce((s, m) => s + m.totalGoals, 0) / matches.length : null;
+    const now = new Date();
+    const todayPrefix = `${String(now.getMonth()+1).padStart(2,'0')}/${String(now.getDate()).padStart(2,'0')}`;
+    res.json({ matches, avgGoals, todayCount: matches.filter(m => m.date.startsWith(todayPrefix)).length });
+  } catch (e: any) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// GET /api/daily-matches?date=MM/DD  — Napi Mérkőzések oldal adatforrása
+// Visszaadja az összes GT Leagues + eAdriatic meccset a nap folyamán.
+// Forrás: VPS menetrend (egész nap) + msport comingSoons (odds overlay, 60 perc előre)
+app.get('/api/daily-matches', async (req, res) => {
+  try {
+    const dateParam = (req.query.date as string) || todayMmDd();
+
+    // 1. VPS menetrend betöltése (egész nap, GT + ADR) — cache-elt, nem okoz extra kérést
+    const vpsRaw = await getVpsSchedule().catch(() => []);
+    for (const e of vpsRaw) {
+      if (!e.playerHome || !e.playerAway || !e.startTime) continue;
+      const RELEVANT = ['GT Leagues', 'eAdriatic League'];
+      if (!RELEVANT.includes(e.league)) continue;
+      const eventId = e.eventId || `vps|${e.playerHome}|${e.playerAway}|${e.startTime}`;
+      if (dailyMatchMap.has(eventId)) continue; // már van msport-ból
+      const date = startTimeToMmDd(e.startTime);
+      dailyMatchMap.set(eventId, {
+        playerA:   (e.playerHome || '').toLowerCase(),
+        playerB:   (e.playerAway || '').toLowerCase(),
+        teamA:     e.teamHome || e.playerHome,
+        teamB:     e.teamAway || e.playerAway,
+        league:    e.league,
+        time:      date,
+        date,
+        ouLine:    e.ouLine    || 0,
+        oddsOver:  e.oddsOver  || 0,
+        oddsUnder: e.oddsUnder || 0,
+        startTime: e.startTime,
+        eventId,
+      });
+    }
+
+    // 2. msport comingSoons (odds overlay, ~60 perc előre) — felülírja az odds-okat ahol van
+    const fresh = await getMsportOdds();
+    updateDailyAccum(fresh);
+
+    const result = Array.from(dailyMatchMap.values())
+      .filter(m => m.date === dateParam)
+      .sort((a, b) => a.startTime - b.startTime);
+
+    // 3. Supabase fallback: ha a szerver újraindult és a dailyMatchMap score mezők üresek,
+    //    a Supabase completed_matches alapján pótoljuk a végeredményeket.
+    //    Csak azon bejegyzéseknél fut, ahol scoreA még undefined.
+    //    FONTOS: start_time Supabase-ben milliszekundumban van tárolva (JS konvenció)!
+    const needsScore = result.filter(m => m.scoreA === undefined);
+    if (needsScore.length > 0 && supabase) {
+      try {
+        const earliest = result.reduce((min, m) => Math.min(min, m.startTime), Infinity);
+        const { data } = await supabase
+          .from('completed_matches')
+          .select('player_a,player_b,score_a,score_b,start_time')
+          .in('league', ['GT Leagues', 'eAdriatic League'])
+          .gte('start_time', earliest - 86400 * 1000)   // ms! (24 óra korábbig)
+          .order('start_time', { ascending: false })
+          .limit(300);
+        if (data && data.length > 0) {
+          for (const m of needsScore) {
+            const pA = m.playerA.toLowerCase();
+            const pB = m.playerB.toLowerCase();
+            // startTime egyezés ±5 perc toleranciával (mindkét mező ms-ben)
+            const found = data.find(row =>
+              Math.abs(row.start_time - m.startTime) < 5 * 60 * 1000 &&
+              ((row.player_a === pA && row.player_b === pB) ||
+               (row.player_a === pB && row.player_b === pA))
+            );
+            if (found) {
+              const isForward = found.player_a === pA;
+              const scoreA = isForward ? found.score_a : found.score_b;
+              const scoreB = isForward ? found.score_b : found.score_a;
+              const entry = dailyMatchMap.get(m.eventId);
+              if (entry) dailyMatchMap.set(m.eventId, { ...entry, scoreA, scoreB });
+              m.scoreA = scoreA;
+              m.scoreB = scoreB;
+            }
+          }
+        }
+      } catch { /* silent — score nélkül is működik */ }
+    }
+
+    res.json(result);
+  } catch (e: any) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+// ============ SCORE ACCUMULATOR POLLER ============
+// Háttérben futó poller: 60 mp-enként ellenőrzi az aznap induló meccseket.
+// Ha egy meccs várható vége eltelt (+2 perc buffer), lekéri az msport match/detail
+// végpontot. Ha isLive=false → a meccs véget ért → injektálja az eredményt a
+// getMsportMatchResults() tárolóba → H2H adatok azonnal elérhetők lesznek.
+//
+// Miért kell ez? Az msport-on nincs dedikált "results" végpont, ezért az
+// eredményeket menet közben gyűjtjük a detail API-ból.
+
+const MATCH_DURATION_MS: Record<string, number> = {
+  'GT Leagues':      12 * 60 * 1000,
+  'eAdriatic League': 10 * 60 * 1000,
+};
+const _completedEventIds = new Set<string>(); // már injektált eventId-k
+
+async function pollCompletedMatchScores(): Promise<void> {
+  const now = Date.now();
+  const BUFFER_AFTER  =  2 * 60 * 1000; // 2 perc buffer a meccs után
+  const GIVE_UP_AFTER = 35 * 60 * 1000; // 35 percnél régebbi → már nem pollolunk
+
+  const toCheck = Array.from(dailyMatchMap.values()).filter(m => {
+    if (_completedEventIds.has(m.eventId)) return false; // már injektáltuk
+    const duration = MATCH_DURATION_MS[m.league] ?? 12 * 60 * 1000;
+    const elapsed = now - m.startTime;
+    return elapsed >= (duration + BUFFER_AFTER) && elapsed <= (duration + GIVE_UP_AFTER);
+  });
+
+  if (toCheck.length === 0) return;
+  console.log(`[accum] ${toCheck.length} meccs ellenőrzése (befejezési státusz)...`);
+
+  const newResults: MsportMatchResult[] = [];
+  for (const m of toCheck) {
+    try {
+      const scores = await getMsportLiveScores([m.eventId]);
+      const score = scores[0];
+      if (score && !score.isLive) {
+        // Meccs befejezve — végeredmény rögzítése
+        const d = new Date(m.startTime + 2 * 3600 * 1000); // Budapest CEST = UTC+2
+        const date =
+          `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')} ` +
+          `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+        newResults.push({
+          eventId:   m.eventId,
+          playerA:   score.playerA,   // kisbetűs (fetchMatchDetail normalizálja)
+          playerB:   score.playerB,
+          teamA:     m.teamA,
+          teamB:     m.teamB,
+          scoreA:    score.scoreA,
+          scoreB:    score.scoreB,
+          startTime: m.startTime,
+          league:    m.league,
+          date,
+        });
+        _completedEventIds.add(m.eventId);
+        // Végeredmény visszaírása a dailyMatchMap-be → /api/daily-matches azonnal visszaadja
+        const existing = dailyMatchMap.get(m.eventId);
+        if (existing) {
+          dailyMatchMap.set(m.eventId, { ...existing, scoreA: score.scoreA, scoreB: score.scoreB });
+        }
+        console.log(
+          `[accum] ✅ ${score.playerA} ${score.scoreA}–${score.scoreB} ${score.playerB}` +
+          ` (${m.league}, ${date})`
+        );
+      } else if (score && score.isLive) {
+        // Még megy — legközelebb újra próbáljuk
+        console.log(`[accum] ⏳ Még él: ${score.playerA} vs ${score.playerB} (${score.minute}')`);
+      }
+    } catch {
+      // silent — legközelebb próbáljuk újra
+    }
+  }
+
+  if (newResults.length > 0) {
+    await injectCompletedMatches(newResults);
+  }
+}
+
+// ── Live Pitch API ────────────────────────────────────────────────────────────
+
+function normPlayer(s: string) { return s.toLowerCase().replace(/[^a-z0-9]/g, ''); }
+function playerNamesMatch(a: string, b: string) {
+  return a.includes(b) || b.includes(a);
+}
+
+// Player-pár → eventId cache (60s TTL): minden 8s-os poll így nem hív Cloudbet-et
+// duplán a név→ID feloldásra. A state frissességét külön 8s stale-check kezeli.
+const pairToEventId = new Map<string, { eventId: number; ts: number }>();
+const PAIR_CACHE_TTL_MS = 60_000;
+function pairKey(a: string, b: string): string {
+  return [normPlayer(a), normPlayer(b)].sort().join('|');
+}
+
+// GET /api/live-pitch?playerA=X&playerB=Y — meccs keresés + góltrack visszaad
+app.get('/api/live-pitch', async (req, res) => {
+  const { playerA, playerB } = req.query as { playerA?: string; playerB?: string };
+
+  if (!playerA || !playerB) {
+    return res.json(getAllMatches());
+  }
+
+  const key   = pairKey(playerA, playerB);
+  const now   = Date.now();
+  const cached = pairToEventId.get(key);
+
+  let eventId: number | undefined;
+  if (cached && (now - cached.ts) < PAIR_CACHE_TTL_MS) {
+    eventId = cached.eventId;
+  } else {
+    const nA = normPlayer(playerA);
+    const nB = normPlayer(playerB);
+
+    // 1. Keresés az élő meccsek között
+    const liveScores = await getCloudbetWebLiveScores().catch(() => []);
+    let found = liveScores.find(s => {
+      const ha = normPlayer(s.homeTeam);
+      const ba = normPlayer(s.awayTeam);
+      return (playerNamesMatch(ha, nA) && playerNamesMatch(ba, nB)) ||
+             (playerNamesMatch(ha, nB) && playerNamesMatch(ba, nA));
+    });
+
+    // 2. Ha nincs élőben, megnézzük a közelgő menetrendet
+    if (!found) {
+      const schedule = await getCloudbetWebSchedule().catch(() => []);
+      const match = schedule.find(s => {
+        const ha = normPlayer(s.homeTeam);
+        const ba = normPlayer(s.awayTeam);
+        return (playerNamesMatch(ha, nA) && playerNamesMatch(ba, nB)) ||
+               (playerNamesMatch(ha, nB) && playerNamesMatch(ba, nA));
+      });
+      if (match) {
+        found = {
+          eventId:          match.id,
+          homeTeam:         match.homeTeam,
+          awayTeam:         match.awayTeam,
+          league:           match.league,
+          homeScore:        0,
+          awayScore:        0,
+          matchTimeSeconds: 0,
+          eventStatus:      'not_started',
+          eventTime:        match.startTime ?? '',
+          updatedAt:        new Date().toISOString(),
+        };
+      }
+    }
+
+    if (!found) return res.status(404).json({ error: 'Meccs nem található' });
+
+    ensureTracked(found.eventId, {
+      homeTeam: found.homeTeam,
+      awayTeam: found.awayTeam,
+      league:   found.league,
+    });
+    eventId = found.eventId;
+    pairToEventId.set(key, { eventId, ts: now });
+  }
+
+  // 8s freshness check — ugyanaz mint a /:eventId endpoint-nál
+  const existing = getMatch(eventId);
+  const staleMs  = existing
+    ? Date.now() - new Date(existing.lastUpdated).getTime()
+    : Infinity;
+  const state = staleMs > 8_000
+    ? (await refreshMatch(eventId)) ?? existing
+    : existing;
+
+  if (!state) return res.status(404).json({ error: 'state not found' });
+  res.json(state);
+});
+
+// GET /api/live-pitch/:eventId — közvetlen eventId alapú lekérés
+app.get('/api/live-pitch/:eventId', async (req, res) => {
+  const eventId = Number(req.params.eventId);
+  if (isNaN(eventId)) return res.status(400).json({ error: 'invalid eventId' });
+
+  ensureTracked(eventId);
+  const existing = getMatch(eventId);
+
+  // Csak akkor kérdezzük le ha régebbi mint 8s
+  const staleMs = existing
+    ? Date.now() - new Date(existing.lastUpdated).getTime()
+    : Infinity;
+
+  const state = staleMs > 8_000 ? await refreshMatch(eventId) : existing;
+  if (!state) return res.status(404).json({ error: 'not found' });
+  res.json(state);
+});
+
+// ============ VÉGÜK ============
+
+const PORT = parseInt(process.env.PORT || '3005', 10);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`--- Szerver fut: ${PORT} ---`);
+
+  // Load Telegram config from env (if set)
+  loadConfigFromEnv();
+
+  // Start background scanners — kellően késleltetve és ritkán, hogy ne okozzanak tiltást msport-on
+  // FONTOS: scannerek csak cache-elt getMsportOdds()-t hívnak (10 perces cache) → max 6 kérés/óra
+  setTimeout(() => startScanner(20 * 60 * 1000), 60_000);        // top-tips scan: 20 percenként, 1 perc után indul
+  setTimeout(() => startTrendScanner(10 * 60 * 1000), 3 * 60_000); // trend scan: 10 percenként, 3 perc után indul
+  startMatchPoller(); // live pitch gól-tracker (10s, Cloudbet alapú)
+
+  // Start Telegram bot polling for commands
+  startBotPolling(handleBotCommand);
+
+  // Cloudbet Web Live Score Poller — 30 másodpercenként fut (meccs idők: 17-02h)
+  // Figyeli az élő meccseket és menti a befejezett meccsek eredményét a H2H DB-be.
+  // Nem igényel API kulcsot — a cloudbet.com belső API-ját használja.
+  const _cbCompletedEventIds = new Set<string>();
+  (function startCloudbetWebPoller() {
+    const poll = async () => {
+      try {
+        // Időablak: alapesetben 17:00–02:00 Budapest. Ha az msport rate-limited,
+        // akkor 24/7 fut → fallback a completed_matches feltöltéshez.
+        const nowHour = new Date(Date.now() + 2 * 3600_000).getUTCHours();
+        const inEveningWindow = !(nowHour < 17 && nowHour > 2);
+        if (!inEveningWindow && !isMsportRateLimited()) return; // pihenő idő (msport viszi)
+
+        // Cache törlés → friss adat kérése (30mp-enként egyszer hívjuk)
+        clearCloudbetWebCache();
+        const events = await getCloudbetWebAllEvents();
+
+        const live     = events.filter(e => e.eventStatus === 'in_progress' || e.status === 'TRADING_LIVE');
+        const finished = events.filter(e => e.eventStatus === 'finished' || e.status === 'RESULTED');
+
+        if (live.length > 0) {
+          console.log(`[cloudbet-web-poller] ⚽ Élő: ${live.map(e => `${e.homeTeam} ${e.homeScore ?? '?'}-${e.awayScore ?? '?'} ${e.awayTeam}`).join(' | ')}`);
+        }
+        if (finished.length > 0) {
+          // Befejezett meccsek konvertálása MsportMatchResult formára és injektálása
+          // (a Supabase completed_matches táblába is — msport rate-limit fallback)
+          const newResults: MsportMatchResult[] = [];
+          for (const e of finished) {
+            const eventId = String(e.id);
+            if (_cbCompletedEventIds.has(eventId)) continue;
+            if (e.homeScore == null || e.awayScore == null) continue;
+            const startMs = Date.parse(e.startTime);
+            if (!Number.isFinite(startMs)) continue;
+            const d = new Date(startMs + 2 * 3600 * 1000); // Budapest CEST = UTC+2
+            const date =
+              `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')} ` +
+              `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+            newResults.push({
+              eventId,
+              playerA: (e.homeTeam || '').toLowerCase(),
+              playerB: (e.awayTeam || '').toLowerCase(),
+              teamA: '',
+              teamB: '',
+              scoreA: e.homeScore,
+              scoreB: e.awayScore,
+              startTime: startMs,
+              league: e.league || '',
+              date,
+            });
+            _cbCompletedEventIds.add(eventId);
+          }
+          if (newResults.length > 0) {
+            const added = await injectCompletedMatches(newResults);
+            console.log(`[cloudbet-web-poller] ✅ Befejezett: ${finished.length} meccs, +${added} új Supabase-be mentve`);
+          } else {
+            console.log(`[cloudbet-web-poller] ✅ Befejezett: ${finished.length} meccs (mind már mentve)`);
+          }
+        }
+      } catch (e) {
+        console.error('[cloudbet-web-poller] hiba:', e);
+      }
+    };
+
+    // 5 perccel indítás után kezdjük (szerver inicializálás után)
+    setTimeout(() => {
+      poll();
+      setInterval(poll, 5 * 60_000); // 5 percenként (Supabase egress csökkentés)
+    }, 5 * 60_000);
+
+    console.log('[cloudbet-web] Live score poller inicializálva (5 perc múlva indul)');
+  })();
+
+  // Lezárt meccsek score pollozása 60 másodpercenként (dailyMatchMap alapján)
+  setInterval(pollCompletedMatchScores, 2 * 60 * 1000); // 2 percenként (Supabase egress csökkentés)
+
+  // Fixture-alapú szinkron: msport fixtures API → Supabase (30 percenként)
+  // Ez a megbízható forrás — nem függ a dailyMatchMap-től
+  const syncFixtures = async () => {
+    if (isMsportRateLimited()) return; // ne próbálkozzunk ha rate-limitedek vagyunk
+    try {
+      clearFixtureCache(); // friss adatot akarunk
+      const fixtures = await scrapeMsportFixtures();
+      if (fixtures.length > 0) {
+        const added = await injectCompletedMatches(fixtures);
+        if (added > 0) console.log(`[accum-sync] +${added} meccs szinkronizálva fixtures API-ból`);
+      }
+    } catch (e) {
+      console.error('[accum-sync] hiba:', e);
+    }
+  };
+  setTimeout(syncFixtures, 2 * 60 * 1000);          // 2 perc után első futás
+  setInterval(syncFixtures, 30 * 60 * 1000);         // majd 30 percenként (kevesebb msport hívás)
+
+  // Napi takarítás: régi injektált rekordok eltávolítása óránként
+  setInterval(clearOldInjectedMatches, 60 * 60 * 1000);
+
+  // Supabase: lezárt meccsek betöltése restart után (60 nap előzmény)
+  initCompletedMatchesFromDb().catch(e => console.error('[startup] initFromDb hiba:', e));
+
+  // VPS live-tracked results szinkronizálása 10 percenként
+  // A VPS figyeli az in-play meccseket és menti a befejezetteket — pótolja az msport API-t
+  setTimeout(() => {
+    fetchVpsResults().catch(() => {});
+    setInterval(() => fetchVpsResults().catch(() => {}), VPS_RESULTS_TTL);
+  }, 30 * 1000); // 30mp késés (szerver inicializálás után)
+});
+
+// SPA fallback — az összes API endpoint UTÁN, minden nem-API route az index.html-t kapja
+app.get('/{*path}', (_req, res) => {
+  res.sendFile(path.join(distPath, 'index.html'));
 });

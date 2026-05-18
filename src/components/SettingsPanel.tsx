@@ -5,6 +5,7 @@ import {
   configureTelegramBot, getTelegramStatus,
   getScannerStatus, triggerScan, ScannerStatus,
 } from '../api';
+import { startVisiblePolling } from '../hooks/visiblePolling';
 
 interface Props {
   settings: Settings;
@@ -29,11 +30,10 @@ export default function SettingsPanel({ settings, onChange }: Props) {
 
   useEffect(() => {
     getTelegramStatus().then(s => setTgConfigured(s.configured)).catch(() => {});
-    getScannerStatus().then(setScannerStatus).catch(() => {});
-    const id = setInterval(() => {
-      getScannerStatus().then(setScannerStatus).catch(() => {});
-    }, 30000);
-    return () => clearInterval(id);
+    return startVisiblePolling(
+      () => getScannerStatus().then(setScannerStatus).catch(() => {}),
+      30000,
+    );
   }, []);
 
   const handleTgConfigure = async () => {

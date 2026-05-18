@@ -1,25 +1,54 @@
 import { useState, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 
+function leagueBadge(l: string) {
+  if (l === 'GT Leagues') return 'bg-green/20 text-green';
+  if (l === 'Esoccer Battle') return 'bg-yellow/20 text-yellow';
+  if (l === 'eAdriatic League') return 'bg-sky-500/20 text-sky-400';
+  if (l === 'Esoccer H2H GG League') return 'bg-orange-500/20 text-orange-400';
+  if (l === 'Esports Volta') return 'bg-cyan-500/20 text-cyan-400';
+  return 'bg-slate-600/30 text-slate-400';
+}
+function leagueAbbr(l: string) {
+  if (l === 'GT Leagues') return 'GT';
+  if (l === 'Esoccer Battle') return 'EB';
+  if (l === 'eAdriatic League') return 'ADR';
+  if (l === 'Esoccer H2H GG League') return 'H2H';
+  if (l === 'Esports Volta') return 'VOLTA';
+  return 'EV';
+}
+
 interface CheckedMatch {
   matchId: string;
   tip: {
     time: string;
     date: string;
+    league?: string;
     playerA: string;
     playerB: string;
     vartGol: number;
     ouLine: number;
     oddsOver?: number;
     oddsUnder?: number;
+    lastMatchesA?: Array<{ opponent: string; scoreHome: number; scoreAway: number; result: string; date: string }>;
+    lastMatchesB?: Array<{ opponent: string; scoreHome: number; scoreAway: number; result: string; date: string }>;
   };
   timestamp: number;
   date: string; // YYYY-MM-DD formátum
   betType?: 'Over' | 'Under';
   betLine?: number;
   result?: 'Win' | 'Loss';
-  stake?: number; // Tét összege
-  odds?: number; // ✅ ÚJ: Odds mező
+  stake?: number;
+  odds?: number;
+  strategy?: 'A' | 'B' | 'C';
+  fromTrend?: boolean;
+  trendType?: 'VALUE' | 'TREND' | 'SUPER_VALUE' | 'SUPER_TREND';
+  trendAboveLinePct?: number;
+  trendAboveLineCount?: number;
+  trendAvgGoals?: number;
+  trendSlope?: number;
+  trendTodayH2H?: Array<{ time: string; goalsA: number; goalsB: number; total: number }>;
+  trendTotalMatches?: number;
 }
 
 interface DayGroup {
@@ -138,25 +167,43 @@ export default function Naplo() {
           setMatches([]);
           return;
         }
-        
+
         const parsed = JSON.parse(stored);
         if (!Array.isArray(parsed)) {
           setMatches([]);
           return;
         }
 
-        const validMatches = parsed.filter((item: any) => 
-          item && 
-          typeof item === 'object' && 
-          item.matchId && 
-          item.tip && 
+        const validMatches = parsed.filter((item: any) =>
+          item &&
+          typeof item === 'object' &&
+          item.matchId &&
+          item.tip &&
           typeof item.tip === 'object'
         );
 
         const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-        const recentMatches = validMatches.filter(m => m.timestamp >= thirtyDaysAgo);
-        
-        setMatches(recentMatches);
+        const recentMatches = validMatches.filter((m: any) => m.timestamp >= thirtyDaysAgo);
+
+        // Merge: a lokálisan már szerkesztett entry mezőit (betType, betLine, odds, stake, result)
+        // megőrizzük — ne írja felül az event a pending user-editet
+        setMatches(prev => {
+          const prevMap = new Map(prev.map(m => [m.matchId, m]));
+          return recentMatches.map((incoming: any) => {
+            const existing = prevMap.get(incoming.matchId);
+            if (!existing) return incoming;
+            // Lokális szerkesztett mezők prioritása
+            return {
+              ...incoming,
+              betType:  existing.betType  !== undefined ? existing.betType  : incoming.betType,
+              betLine:  existing.betLine  !== undefined ? existing.betLine  : incoming.betLine,
+              odds:     existing.odds     !== undefined ? existing.odds     : incoming.odds,
+              stake:    existing.stake    !== undefined ? existing.stake    : incoming.stake,
+              result:   existing.result   !== undefined ? existing.result   : incoming.result,
+            };
+          });
+        });
+
         console.log('✅ Napló frissítve!', recentMatches.length, 'meccs');
       } catch (e) {
         console.error('Napló frissítési hiba:', e);
@@ -502,18 +549,104 @@ export default function Naplo() {
                       return (
                         <div
                           key={idx}
-                          className="bg-dark-bg/40 border border-dark-border rounded-lg p-3"
+                          className="rounded-lg p-3 border"
+                          style={
+                            match.trendType === 'SUPER_VALUE'
+                              ? { backgroundColor: 'rgba(253,224,71,0.10)', borderColor: '#fde047', boxShadow: '0 0 8px rgba(253,224,71,0.25)' }
+                            : match.trendType === 'SUPER_TREND'
+                              ? { backgroundColor: 'rgba(249,115,22,0.10)', borderColor: '#f97316', boxShadow: '0 0 8px rgba(249,115,22,0.25)' }
+                            : match.trendType === 'VALUE'
+                              ? { backgroundColor: 'rgba(253,224,71,0.06)', borderColor: '#fde04750' }
+                            : match.trendType === 'TREND'
+                              ? { backgroundColor: 'rgba(249,115,22,0.06)', borderColor: '#f9731650' }
+                            : { backgroundColor: 'rgba(15,23,42,0.4)', borderColor: 'rgba(30,41,59,1)' }
+                          }
                         >
                           {/* Sor 1: Meccs info + eredmény + törlés */}
-                          <div className="flex items-center gap-4 mb-2">
+                          <div className="flex items-center gap-2 mb-2">
+                            {match.tip.league && (
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 ${leagueBadge(match.tip.league)}`}>
+                                {leagueAbbr(match.tip.league)}
+                              </span>
+                            )}
+                            {match.strategy === 'A' && (
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 bg-emerald-600 text-white">A</span>
+                            )}
+                            {match.strategy === 'B' && (
+                              <span style={{backgroundColor:'#facc15',color:'#111827'}} className="px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0">B</span>
+                            )}
+                            {match.strategy === 'C' && (
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 bg-orange-500 text-white">C</span>
+                            )}
+                            {match.fromTrend && match.trendType === 'SUPER_VALUE' && (
+                              <span style={{backgroundColor:'#fde047',color:'#111827',boxShadow:'0 0 6px rgba(253,224,71,0.6)'}} className="px-1.5 py-0.5 rounded text-[9px] font-black shrink-0 animate-pulse">
+                                💥 SUPER VALUE
+                              </span>
+                            )}
+                            {match.fromTrend && match.trendType === 'SUPER_TREND' && (
+                              <span style={{backgroundColor:'#f97316',color:'#fff',boxShadow:'0 0 6px rgba(249,115,22,0.6)'}} className="px-1.5 py-0.5 rounded text-[9px] font-black shrink-0 animate-pulse">
+                                🔥 SUPER TREND
+                              </span>
+                            )}
+                            {match.fromTrend && match.trendType === 'VALUE' && (
+                              <span style={{backgroundColor:'#facc15',color:'#111827'}} className="px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0">
+                                💰 VALUE
+                              </span>
+                            )}
+                            {match.fromTrend && match.trendType === 'TREND' && (
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 bg-orange-500 text-white">
+                                🚀 TREND
+                              </span>
+                            )}
                             <span className="text-sm font-mono text-white w-14 shrink-0">{match.tip.time}</span>
-                            <div className="flex-1">
+                            <div className="flex-1 min-w-0">
                               <p className="text-sm text-white font-semibold">
                                 {match.tip.playerA} vs {match.tip.playerB}
                               </p>
-                              <p className="text-xs text-slate-400">
-                                GÓL {match.tip.vartGol.toFixed(1)} | O/U {match.tip.ouLine}
-                              </p>
+                              {match.fromTrend ? (
+                                <div className="flex items-center gap-2 mt-1 overflow-x-auto scrollbar-none">
+                                  <span className="text-xs text-slate-400 shrink-0">O/U <span className="text-white font-bold">{match.betLine ?? match.tip.ouLine}</span></span>
+                                  {match.trendAboveLineCount !== undefined && match.trendTotalMatches !== undefined && (
+                                    <span className="text-xs text-slate-400 shrink-0">Felett: <span className="text-yellow-300 font-bold">{match.trendAboveLineCount}/{match.trendTotalMatches} ({Math.round((match.trendAboveLinePct ?? 0) * 100)}%)</span></span>
+                                  )}
+                                  {match.trendAvgGoals !== undefined && (
+                                    <span className="text-xs text-slate-400 shrink-0">Átlag: <span className="text-white font-bold">{match.trendAvgGoals.toFixed(1)}</span></span>
+                                  )}
+                                  {match.trendType === 'TREND' && match.trendSlope !== undefined && (
+                                    <span className="text-xs text-slate-400 shrink-0">Trend: <span className="text-orange-400 font-bold">{match.trendSlope >= 0 ? '+' : ''}{match.trendSlope.toFixed(1)}/m</span></span>
+                                  )}
+                                  {match.trendTodayH2H && match.trendTodayH2H.length > 0 && match.trendTodayH2H.map((h, hi) => (
+                                    <span key={hi} className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded shrink-0 ${h.total > (match.betLine ?? match.tip.ouLine) ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>
+                                      {h.goalsA}–{h.goalsB}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2 mt-1 overflow-x-auto scrollbar-none">
+                                  <span className="text-xs text-slate-400 shrink-0">GÓL <span className="text-white font-bold">{match.tip.vartGol.toFixed(1)}</span></span>
+                                  <span className="text-xs text-slate-400 shrink-0">O/U <span className="text-white font-bold">{match.tip.ouLine}</span></span>
+                                  {match.tip.lastMatchesA && match.tip.lastMatchesA.length > 0 && (
+                                    <>
+                                      <span className="text-xs text-slate-500 shrink-0 ml-1">{match.tip.playerA.split(' ')[0]}:</span>
+                                      {match.tip.lastMatchesA.slice(0, 5).map((lm, li) => (
+                                        <span key={li} className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded shrink-0 ${lm.result === 'win' ? 'bg-green-600 text-white' : lm.result === 'loss' ? 'bg-red-600 text-white' : 'bg-slate-600 text-white'}`}>
+                                          {lm.scoreHome}–{lm.scoreAway}
+                                        </span>
+                                      ))}
+                                    </>
+                                  )}
+                                  {match.tip.lastMatchesB && match.tip.lastMatchesB.length > 0 && (
+                                    <>
+                                      <span className="text-xs text-slate-500 shrink-0 ml-1">{match.tip.playerB.split(' ')[0]}:</span>
+                                      {match.tip.lastMatchesB.slice(0, 5).map((lm, li) => (
+                                        <span key={li} className={`text-xs font-mono font-bold px-1.5 py-0.5 rounded shrink-0 ${lm.result === 'win' ? 'bg-green-600 text-white' : lm.result === 'loss' ? 'bg-red-600 text-white' : 'bg-slate-600 text-white'}`}>
+                                          {lm.scoreHome}–{lm.scoreAway}
+                                        </span>
+                                      ))}
+                                    </>
+                                  )}
+                                </div>
+                              )}
                             </div>
                             <div className="text-right shrink-0">
                               {match.result ? (
@@ -556,7 +689,7 @@ export default function Naplo() {
                               className="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-accent"
                             >
                               <option value="">Vonal</option>
-                              {[1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5,9.5,10.5,11.5].map(v => (
+                              {[1.25,1.5,1.75,2.25,2.5,2.75,3.25,3.5,3.75,4.25,4.5,4.75,5.25,5.5,5.75,6.25,6.5,6.75,7.25,7.5,7.75,8.25,8.5,8.75,9.25,9.5,9.75,10.25,10.5,10.75,11.25,11.5,11.75].map(v => (
                                 <option key={v} value={v}>{v}</option>
                               ))}
                             </select>

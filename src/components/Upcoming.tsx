@@ -12,13 +12,13 @@ function genId() {
 
 function leagueToLiga(league: string): Liga {
   if (league === 'GT Leagues') return 'GT Leagues';
-  if (league === 'Cyber Live Arena') return 'eAdriaticLeague';
+  if (league === 'eAdriatic League') return 'eAdriaticLeague';
   return 'Other';
 }
 
 function leagueMinutes(league: string): number {
   if (league === 'GT Leagues') return 12;
-  if (league === 'Cyber Live Arena') return 10;
+  if (league === 'eAdriatic League') return 10;
   if (league === 'Esoccer Battle') return 8;
   if (league === 'Esports Volta') return 6;
   return 10;
@@ -85,19 +85,19 @@ export default function Upcoming({ onAnalyze }: Props) {
     }
   };
 
-  const leagues = ['all', 'GT Leagues', 'Esoccer Battle', 'Cyber Live Arena', 'Esports Volta'];
+  const leagues = ['all', 'GT Leagues', 'Esoccer Battle', 'eAdriatic League', 'Esports Volta'];
   const leagueLabels: Record<string, string> = {
     all: 'Összes',
     'GT Leagues': 'GT Leagues (12p)',
     'Esoccer Battle': 'Esoccer Battle (8p)',
-    'Cyber Live Arena': 'Cyber Live Arena (10p)',
+    'eAdriatic League': 'eAdriatic League (10p)',
     'Esports Volta': 'Esports Volta (6p)',
   };
 
   const leagueBadge = (l: string) => {
     if (l === 'GT Leagues') return 'bg-green/20 text-green';
     if (l === 'Esoccer Battle') return 'bg-yellow/20 text-yellow';
-    if (l === 'Cyber Live Arena') return 'bg-purple/20 text-purple';
+    if (l === 'eAdriatic League') return 'bg-sky-500/20 text-sky-400';
     return 'bg-slate-600/30 text-slate-400';
   };
 
@@ -160,7 +160,7 @@ export default function Upcoming({ onAnalyze }: Props) {
 
                 {/* League badge */}
                 <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${leagueBadge(entry.league)}`}>
-                  {entry.league === 'GT Leagues' ? 'GT' : entry.league === 'Esoccer Battle' ? 'EB' : entry.league === 'Cyber Live Arena' ? 'CLA' : 'EV'}
+                  {entry.league === 'GT Leagues' ? 'GT' : entry.league === 'Esoccer Battle' ? 'EB' : entry.league === 'eAdriatic League' ? 'ADR' : 'EV'}
                 </span>
 
                 {/* Players */}

@@ -98,7 +98,7 @@ export default function PlayerProfile({ onBack, initialPlayer = '', initialLeagu
           <select value={league} onChange={e => setLeague(e.target.value)} className={ic}>
             <option value="GT Leagues">GT Leagues (12p)</option>
             <option value="Esoccer Battle">Esoccer Battle (8p)</option>
-            <option value="Cyber Live Arena">Cyber Live Arena (10p)</option>
+            <option value="eAdriatic League">eAdriatic League (10p)</option>
             <option value="Esports Volta">Esports Volta (6p)</option>
           </select>
           <button

@@ -75,7 +75,7 @@ export default function Backtest() {
           <select value={league} onChange={e => setLeague(e.target.value)} className={ic}>
             <option value="GT Leagues">GT Leagues</option>
             <option value="Esoccer Battle">Esoccer Battle</option>
-            <option value="Cyber Live Arena">Cyber Live Arena</option>
+            <option value="eAdriatic League">eAdriatic League</option>
           </select>
           <button
             onClick={handleBacktest}

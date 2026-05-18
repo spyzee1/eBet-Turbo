@@ -12,7 +12,7 @@ function leagueToEsoccerBet(league: string): string {
   // Frontend uses 'GT Leagues' | 'eAdriaticLeague' | 'Other' or TopTips league string
   if (league === 'GT Leagues') return 'GT Leagues';
   if (league === 'Esoccer Battle') return 'Esoccer Battle';
-  if (league === 'Cyber Live Arena' || league === 'eAdriaticLeague') return 'Cyber Live Arena';
+  if (league === 'eAdriatic League' || league === 'eAdriaticLeague') return 'eAdriatic League';
   return 'GT Leagues';
 }
 
