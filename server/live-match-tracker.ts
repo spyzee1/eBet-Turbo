@@ -4,6 +4,7 @@
 
 import { fetchSingleEvent } from './cloudbet-web-scraper.js';
 import { getCloudbetApiLiveScores } from './cloudbet-scraper.js';
+import { getAllLiveScores } from './vegas-scraper.js';
 
 // ── Típusok ───────────────────────────────────────────────────────────────────
 
@@ -111,12 +112,28 @@ async function _doRefresh(eventId: number): Promise<LiveMatchState | null> {
       const liveScores = await getCloudbetApiLiveScores();
       const apiMatch   = liveScores.find(s => s.eventId === eventId);
       if (apiMatch && apiMatch.isLive) {
-        const prev            = tracked.get(eventId);
-        const homeScore       = apiMatch.scoreA;
-        const awayScore       = apiMatch.scoreB;
+        const prev             = tracked.get(eventId);
+        let homeScore          = apiMatch.scoreA;
+        let awayScore          = apiMatch.scoreB;
+        let scoreKnown         = apiMatch.scoreKnown;
         const matchTimeSeconds = apiMatch.minute * 60;
 
-        const newGoals = (prev && apiMatch.scoreKnown)
+        // Ha cloudbet-api nem adja a pontszámot, Altenar (GT Leagues) cache-ből pótoljuk
+        if (!scoreKnown) {
+          try {
+            const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const nA = norm(apiMatch.playerA), nB = norm(apiMatch.playerB);
+            const altenarScores = await getAllLiveScores();
+            const alt = altenarScores.find(a => {
+              const aA = norm(a.playerA), aB = norm(a.playerB);
+              return (aA.includes(nA) || nA.includes(aA)) && (aB.includes(nB) || nB.includes(aB))
+                  || (aA.includes(nB) || nB.includes(aA)) && (aB.includes(nA) || nA.includes(aB));
+            });
+            if (alt) { homeScore = alt.scoreA; awayScore = alt.scoreB; scoreKnown = true; }
+          } catch { /* skip */ }
+        }
+
+        const newGoals = (prev && scoreKnown)
           ? detectNewGoals(
               { homeScore: prev.homeScore, awayScore: prev.awayScore, matchTimeSeconds: prev.matchTimeSeconds },
               { homeScore, awayScore, matchTimeSeconds },
@@ -128,8 +145,8 @@ async function _doRefresh(eventId: number): Promise<LiveMatchState | null> {
           homeTeam:         apiMatch.teamA || prev?.homeTeam || '',
           awayTeam:         apiMatch.teamB || prev?.awayTeam || '',
           league:           apiMatch.league || prev?.league  || '',
-          homeScore:        apiMatch.scoreKnown ? homeScore : (prev?.homeScore ?? 0),
-          awayScore:        apiMatch.scoreKnown ? awayScore : (prev?.awayScore ?? 0),
+          homeScore:        scoreKnown ? homeScore : (prev?.homeScore ?? 0),
+          awayScore:        scoreKnown ? awayScore : (prev?.awayScore ?? 0),
           matchTimeSeconds,
           eventStatus:      'in_progress',
           goals:            dedupeGoals([...(prev?.goals ?? []), ...newGoals]),
