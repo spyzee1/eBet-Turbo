@@ -1933,6 +1933,18 @@ app.get('/api/top-tips', async (req, res) => {
             };
             const fetchCloudbet = async (): Promise<OddsResult> => {
               try {
+                // VPS cache előbb (GT + eAdriatic, IP-block mentes)
+                const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+                const nA = norm(entry.playerHome), nB = norm(entry.playerAway);
+                const vpsEntry = _vpsCbOdds.find(o => {
+                  const eA = norm(o.playerA), eB = norm(o.playerB);
+                  return (eA.includes(nA) || nA.includes(eA)) && (eB.includes(nB) || nB.includes(eB))
+                      || (eA.includes(nB) || nB.includes(eA)) && (eB.includes(nA) || nA.includes(eB));
+                });
+                if (vpsEntry && vpsEntry.ouLine > 0) {
+                  return { ouLine: vpsEntry.ouLine, oddsOver: vpsEntry.oddsOver, oddsUnder: vpsEntry.oddsUnder, source: 'cloudbet' };
+                }
+                // Fallback: Trading API (eAdriatic, API key szükséges)
                 if (!getCloudbetKeyStatus().configured) return null;
                 const r = await getCloudbetOddsForMatch(entry.playerHome, entry.playerAway);
                 return r && r.ouLine > 0 ? { ...r, source: 'cloudbet' } : null;
